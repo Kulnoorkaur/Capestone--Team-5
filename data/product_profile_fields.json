@@ -1,0 +1,44 @@
+[
+    {
+        "id": "PIP-001",
+        "name": "Product Name",
+        "question": "What is the name of the AI medical device?",
+        "type": "string",
+        "required": true
+    },
+    {
+        "id": "PIP-002",
+        "name": "Intended Medical Purpose",
+        "question": "What is the intended medical purpose of the product?",
+        "type": "string",
+        "required": true
+    },
+    {
+        "id": "PIP-003",
+        "name": "Clinical Problem",
+        "question": "What clinical problem is the product designed to address?",
+        "type": "string",
+        "required": true
+    },
+    {
+        "id": "PIP-004",
+        "name": "Clinical Application",
+        "question": "How will the product be used in clinical practice?",
+        "type": "string",
+        "required": true
+    },
+    {
+        "id": "PIP-005",
+        "name": "Anatomical Region",
+        "question": "What anatomical region does the product analyze?",
+        "type": "string",
+        "required": true
+    },
+    {
+        "id": "PIP-006",
+        "name": "Imaging Modality",
+        "question": "What imaging modality does the product use (CT, MRI, X-ray, ultrasound, or other)?",
+        "type": "string",
+        "required": true
+    }
+]
