@@ -1,70 +1,107 @@
 import streamlit as st
+# Deliverable 2.2: AI Function and Clinical Workflow
 
-def show_ai_function_questionnaire():
+FIELD_LABELS = {
+    "AIF-001": "AI Input Information",
+    "AIF-002": "Technical Input Requirements",
+    "AIF-003": "Input Sources",
+    "AIF-004": "AI Processing",
+    "AIF-005": "Image Modification"
+}
+
+def render_ai_function():
 
     st.header("AI Function and Clinical Workflow")
 
     st.write(
-        "This section collects information about the AI system's "
-        "inputs, outputs, clinical role, and level of automation."
+        "Provide information about how the AI system "
+        "processes inputs, generates outputs, and "
+        "interacts with healthcare professionals."
     )
 
-    st.subheader("2.1 AI Inputs and Processing")
+    profile = {}
 
-    aif_001 = st.multiselect(
-        "AIF-001: What input information does the software use?",
+    # SECTION 1: AI INPUTS AND PROCESSING
+    
+    st.divider()
+    st.subheader("01 / AI Inputs and Processing")
+
+    profile["AIF-001"] = st.multiselect(
+        "AI Input Information",
         [
             "Medical images",
             "Image-derived measurements",
             "Clinical metadata",
             "Other"
-        ]
+        ],
+        key="AIF-001"
     )
 
-    aif_002 = st.text_area(
-        "AIF-002: What technical input requirements or limitations "
-        "apply to the AI function?"
+    if "Other" in profile["AIF-001"]:
+        profile["AIF-001-OTHER"] = st.text_input(
+            "Please specify the other input information",
+            key="AIF-001-OTHER"
+        )
+
+    profile["AIF-002"] = st.text_area(
+        "Technical Input Requirements",
+        placeholder=(
+            "Describe supported image formats, "
+            "resolution or image-quality requirements, "
+            "and any unsupported input conditions."
+        ),
+        height=100,
+        key="AIF-002"
     )
 
-    aif_003 = st.multiselect(
-        "AIF-003: Where do inputs come from and how are they received?",
+    profile["AIF-003"] = st.multiselect(
+        "Input Sources",
         [
             "Scanner",
             "PACS",
             "EHR",
             "User upload",
             "Other"
-        ]
+        ],
+        key="AIF-003"
     )
 
-    aif_004 = st.text_area(
-        "AIF-004: Describe how the AI processes the input information "
-        "to perform its intended function."
-    )
-
-    aif_005 = st.selectbox(
-        "AIF-005: Does the AI alter an image or create a new image "
-        "for clinical interpretation?",
-        ["Select an answer", "Yes", "No", "Unknown"]
-    )
-
-    aif_005_details = ""
-
-    if aif_005 == "Yes":
-        aif_005_details = st.text_area(
-            "Describe the image modification and whether "
-            "the original image is retained."
+    if "Other" in profile["AIF-003"]:
+        profile["AIF-003-OTHER"] = st.text_input(
+            "Please specify the input source",
+            key="AIF-003-OTHER"
         )
 
-    answers = {
-        "AIF-001": aif_001,
-        "AIF-002": aif_002,
-        "AIF-003": aif_003,
-        "AIF-004": aif_004,
-        "AIF-005": {
-            "value": aif_005,
-            "description": aif_005_details
-        }
-    }
+    profile["AIF-004"] = st.text_area(
+        "AI Processing",
+        placeholder=(
+            "Describe how the AI processes the input "
+            "information to perform its intended function."
+        ),
+        height=100,
+        key="AIF-004"
+    )
 
-    return answers
+    profile["AIF-005"] = st.selectbox(
+        "Image Modification",
+        [
+            "Select an option",
+            "Yes",
+            "No",
+            "Unknown"
+        ],
+        key="AIF-005"
+    )
+
+    if profile["AIF-005"] == "Yes":
+        profile["AIF-005-DETAILS"] = st.text_area(
+            "Describe the image modification",
+            placeholder=(
+                "Explain how the image is modified "
+                "and whether the original image is retained."
+            ),
+            height=100,
+            key="AIF-005-DETAILS"
+        )
+
+    return profile
