@@ -106,8 +106,8 @@ def render_ai_function():
     profile["AIF-004"] = st.text_area(
         "How does the AI process the input information to perform its function?",
         placeholder=(
-            "Describe the processing steps; distinguish this from "
-            "the overall product operations in D2.1."
+            "Example: The AI analyzes CT images to identify potential "
+            "lung nodules and highlights suspicious regions for radiologist review."
         ),
         key="AIF-004",
         height=100,
@@ -201,7 +201,7 @@ def render_ai_function():
 
     profile["AIF-011"] = st.text_area(
         "Who receives the AI output, and who is responsible for the clinical decision?",
-        placeholder="Reference intended user roles from D2.1 where appropriate.",
+        placeholder="Example: The AI output is displayed to a radiologist, who reviews the findings and makes the final clinical decision.",
         key="AIF-011",
         height=100,
     )
