@@ -3,8 +3,9 @@
 These checks are not regulatory classification or readiness decisions.
 Confirm REQUIRED_FIELDS against the team's finalized D2.2 data dictionary.
 """
-from questionnaires.ai_function import FIELD_LABELS
-
+# from ai_function import FIELD_LABELS, render_ai_function
+from app.deliverable_2.questionnaires.ai_function import FIELD_LABELS
+import streamlit as st
 # REQUIRED FIELDS
 
 # PROVISIONAL: Confirm required/conditional status in D2.2 data dictionary.
