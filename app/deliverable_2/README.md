@@ -9,6 +9,7 @@ Located in `questionnaires/`
 - **product_profile.py** – D2.1 questionnaire for product identification and intended use.
 - **ai_function.py** – D2.2 questionnaire for AI inputs, outputs, clinical workflow, and automation.
 - **Dataset_&_evidence_profile.py** – Questionnaire for dataset and evidence information.
+- **risk_documentation.py** – D2.5 questionnaire for product-related risks, risk controls, cybersecurity measures, user information, and existing regulatory documentation.
 
 These files contain the questions and collect user responses.
 
@@ -18,6 +19,7 @@ Located in `validation/`
 
 - **run_product_profile.py** – Runs the D2.1 questionnaire, validates responses, displays a profile summary, and allows JSON export.
 - **run_ai_function.py** – Runs the D2.2 questionnaire, validates responses, displays a profile summary, and allows JSON export.
+- **run_risk_documentation.py** – Runs the D2.5 questionnaire, validates responses, displays a profile summary, and allows JSON export.
 
 The validation checks identify missing, uncertain, or inconsistent information. They do not determine regulatory classification or readiness.
 
