@@ -44,3 +44,55 @@ PYTHONPATH=. python -m streamlit run app/deliverable_2/validation/run_ai_functio
 ## Development Status
 
 The questionnaires are currently being developed and tested separately before being integrated into the complete AI Model Profile.
+
+
+## Deliverable 2.6 – Integrated Imaging-AI Product Profile
+
+**Integration Lead:** Chandrima Podder
+
+### Overview
+Deliverable 2.6 integrates the five questionnaire components (D2.1–D2.5) into a unified Imaging-AI Product Profile V1.
+
+The integration provides four framework-specific regulatory decision-tree structures:
+- Health Canada
+- FDA
+- EU MDR
+- EU AI Act
+
+The integrated framework uses the Deliverable 1.6 Regulatory Requirements Matrix to maintain traceability between questionnaire fields, regulatory requirements, source references, and readiness gates.
+
+### Implementation
+The integration is implemented in:
+
+`app/deliverable_2/integration/run_integrated_profile.py`
+
+The application integrates:
+- D2.1 – Product and Intended-Use Profile
+- D2.2 – AI Function and Clinical Workflow
+- D2.3 – Algorithm and Change Control
+- D2.4 – Dataset and Evidence
+- D2.5 – Risk, Cybersecurity, and Documentation
+
+### Running the Integrated Application
+
+From the repository root:
+
+```bash
+python -m pip install -r app/deliverable_2/questionnaires/requirements.txt
+python -m streamlit run app/deliverable_2/integration/run_integrated_profile.py
+```
+
+### Outputs
+The integrated application provides:
+- Consolidated product-profile responses (JSON)
+- Four regulatory decision-tree assessments and issue log (JSON)
+- Integrated field dictionary (CSV)
+- Regulatory requirements traceability crosswalk (CSV)
+
+Missing, uncertain, and conflicting information is flagged for manual regulatory review.
+
+### Limitations
+This is a preliminary regulatory research and decision-support framework, not a validated regulatory classification or compliance assessment tool.
+
+Decision-tree outcomes, regulatory source mappings, and proposed integration fields require further team review and regulatory verification before finalization.
+
