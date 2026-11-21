@@ -23,7 +23,7 @@ from app.chatbot.chat_llm import (
     handle_user_clarification,
 )
 
-from app.chatbot.questionnaire_bridge import QuestionnaireBridge
+from app.chatbot.questionnaire_bridge import CONDITIONAL_FIELDS, QuestionnaireBridge
 
 
 # ============================================================
@@ -62,11 +62,13 @@ def initialize_session():
         "field_suggestions": dict,
         "asked_field": lambda: None,
         "asked_question": lambda: None,
+        "retryable_turn": lambda: None,
         "intake_started": lambda: False,
         "questionnaire_complete": lambda: False,
         "needs_next_question": lambda: False,
         "clarification_needed": lambda: False,
         "editor_version": lambda: 0,
+        "review_batch_version": lambda: 0,
         "active_questionnaire": lambda: "D2.1",
     }
 
@@ -250,9 +252,7 @@ def process_next_question():
     current_field = st.session_state.asked_field
 
     # Drop a previously asked conditional question if it is no longer active.
-    from app.chatbot.questionnaire_bridge import CONDITIONAL_FIELDS
-    all_conditional = set(CONDITIONAL_FIELDS)
-    if current_field in all_conditional:
+    if current_field in CONDITIONAL_FIELDS:
         active = set(bridge.get_active_conditional_fields(questionnaire_for_field(current_field)))
         if current_field not in active:
             st.session_state.asked_field = None
@@ -327,11 +327,13 @@ def reset_application():
         "field_suggestions",
         "asked_field",
         "asked_question",
+        "retryable_turn",
         "intake_started",
         "questionnaire_complete",
         "needs_next_question",
         "clarification_needed",
         "editor_version",
+        "review_batch_version",
         "active_questionnaire",
     ]
 
@@ -380,6 +382,7 @@ def restore_profile(uploaded_file):
             valid, error = candidate.save_answer(field_id, profile[field_id])
             if not valid:
                 return False, f"{field_id}: {error}"
+    st.session_state.retryable_turn = None
     st.session_state.questionnaire_bridge = candidate
     st.session_state.field_suggestions = {}
     st.session_state.asked_field = None
@@ -592,7 +595,7 @@ with chat_tab:
 
                 widget_key = (
                     f"review_{field_id}_"
-                    f"{st.session_state.editor_version}"
+                    f"{st.session_state.review_batch_version}"
                 )
 
                 if field_type == "text":
@@ -681,167 +684,86 @@ with chat_tab:
     # CHAT INPUT
     # --------------------------------------------------------
 
+    current_field = st.session_state.asked_field
+    current_question = st.session_state.asked_question
+    questionnaire = st.session_state.active_questionnaire
+    question_context = (questionnaire, current_field, current_question)
+
+    retryable_turn = st.session_state.retryable_turn
+    if retryable_turn and retryable_turn["context"] != question_context:
+        st.session_state.retryable_turn = None
+        retryable_turn = None
+
+    retry_clicked = False
+    if retryable_turn:
+        st.warning(
+            "Gemini couldn't process your last message. You can retry it "
+            "or submit a new message."
+        )
+        retry_clicked = st.button(
+            "Retry last message",
+            disabled=bool(st.session_state.field_suggestions),
+        )
+
     user_message = st.chat_input(
         "Describe your product or answer the question...",
-        disabled=bool(
-            st.session_state.field_suggestions
-        ),
+        disabled=bool(st.session_state.field_suggestions),
     )
 
     if user_message:
-
-        add_message(
-            "user",
-            user_message,
-        )
-
+        add_message("user", user_message)
         st.session_state.intake_started = True
+    elif retry_clicked:
+        user_message = retryable_turn["message"]
 
+    if user_message:
         with st.spinner("Gemini is analyzing your response..."):
-
-            is_clarification = False
-            processing_succeeded = False
-
             try:
-                current_field = st.session_state.asked_field
+                confirmed_answers = bridge.get_product_profile()
+                clarification = handle_user_clarification(
+                    user_message=user_message,
+                    current_field_id=current_field,
+                    current_question=current_question,
+                    confirmed_answers=confirmed_answers,
+                )
 
-                # First, identify clarification requests.
-                try:
-                    clarification = handle_user_clarification(
-                        user_message=user_message,
-                        current_field_id=current_field,
-                        current_question=st.session_state.asked_question,
-                        confirmed_answers=bridge.get_product_profile(),
-                    )
-
-                    is_clarification = clarification["is_clarification"]
-
-                except Exception:
-                    # Local fallback if Gemini is unavailable.
-                    message_lower = user_message.lower()
-
-                    clarification_phrases = (
-                        "what is ",
-                        "what does ",
-                        "what do you mean",
-                        "what does it mean",
-                        "explain ",
-                        "give me an example",
-                        "can you clarify",
-                        "help me understand",
-                        "why are you asking",
-                    )
-
-                    is_clarification = any(
-                        phrase in message_lower
-                        for phrase in clarification_phrases
-                    )
-
-                    if is_clarification:
-                        field_id = current_field or ""
-                        parent_id = field_id.removesuffix("-OTHER")
-
-                        if parent_id == "PIP-006":
-                            response = (
-                                "Imaging modality means the type of "
-                                "medical imaging technology your "
-                                "software uses. Examples include CT, "
-                                "MRI, X-ray and ultrasound. For "
-                                "RetinaGuard AI, this would be "
-                                "digital retinal fundus photography."
-                            )
-                        else:
-                            label = bridge.get_field_label(parent_id)
-                            response = (
-                                f"{label} refers to the information "
-                                "this question is asking about. "
-                                "I can help explain it or provide "
-                                "an example if you need one."
-                            )
-
-                        add_message("assistant", response)
-                        processing_succeeded = True
-
-                # Handle clarification without extracting answers.
-                if is_clarification and not processing_succeeded:
-
-                    add_message(
-                        "assistant",
-                        clarification["response"],
-                    )
-
-                    processing_succeeded = True
-
-                # Only extract questionnaire information when
-                # the user is actually providing product information.
-                elif not is_clarification:
-
+                if clarification["is_clarification"]:
+                    add_message("assistant", clarification["response"])
+                else:
                     extracted = extract_questionnaire_fields(
                         user_message=user_message,
-                        confirmed_answers=bridge.get_product_profile(),
+                        confirmed_answers=confirmed_answers,
                         target_field_id=current_field,
-                        target_question=st.session_state.asked_question,
-                        questionnaire=st.session_state.active_questionnaire,
+                        target_question=current_question,
+                        questionnaire=questionnaire,
                     )
 
                     if extracted:
-                        st.session_state.field_suggestions.update(
-                            extracted
-                        )
-
+                        st.session_state.review_batch_version += 1
+                        st.session_state.field_suggestions.update(extracted)
                         add_message(
                             "assistant",
-                            (
-                                f"I identified {len(extracted)} "
-                                "potential questionnaire answer(s). "
-                                "Please review and confirm them below."
-                            ),
+                            f"I identified {len(extracted)} potential questionnaire "
+                            "answer(s). Please review and confirm them below.",
                         )
-
                     elif current_field is not None:
-                        ask_question(
-                            current_field,
-                            clarification=True,
-                        )
-
+                        ask_question(current_field, clarification=True)
                     else:
                         add_message(
                             "assistant",
-                            (
-                                "I couldn't identify a supported "
-                                "questionnaire answer. Could you "
-                                "provide more details about your product?"
-                            ),
+                            "I couldn't identify a supported questionnaire answer. "
+                            "Could you provide more details about your product?",
                         )
-
-                    processing_succeeded = True
+                        schedule_next_question()
 
             except Exception as error:
-
-                add_message(
-                    "assistant",
-                    (
-                        "I'm temporarily unable to process that "
-                        "response. Your message has been retained. "
-                        "Please try again shortly."
-                    ),
-                )
-
-                st.warning(
-                    "The AI service is temporarily unavailable. "
-                    "Your confirmed answers have not been changed."
-                )
-
+                st.session_state.retryable_turn = {
+                    "message": user_message,
+                    "context": question_context,
+                }
                 print(f"Chat Buddy processing error: {error}")
-
-            # Never advance after a clarification question.
-            if (
-                processing_succeeded
-                and not is_clarification
-                and not st.session_state.field_suggestions
-                and st.session_state.asked_field is None
-            ):
-                schedule_next_question()
+            else:
+                st.session_state.retryable_turn = None
 
         st.rerun()
 
@@ -955,17 +877,26 @@ with manual_tab:
 
                         st.session_state.editor_version += 1
 
-                        st.session_state.field_suggestions.pop(
-                            field_id,
-                            None,
-                        )
+                        suggestions = st.session_state.field_suggestions
+                        suggestions.pop(field_id, None)
+                        active_conditionals = {
+                            child_id
+                            for questionnaire in QUESTIONNAIRES
+                            for child_id in bridge.get_active_conditional_fields(questionnaire)
+                        }
+                        inactive_conditionals = CONDITIONAL_FIELDS.keys() - active_conditionals
+                        for child_id in suggestions.keys() & inactive_conditionals:
+                            suggestions.pop(child_id)
 
-                        # Continue the conversation when
-                        # all suggestions are resolved.
-
+                        current_field = st.session_state.asked_field
                         if (
-                            not st.session_state.field_suggestions
+                            not suggestions
                             and st.session_state.intake_started
+                            and (
+                                current_field is None
+                                or current_field in bridge.answers
+                                or current_field in inactive_conditionals
+                            )
                         ):
 
                             schedule_next_question()

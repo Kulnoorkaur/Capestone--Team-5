@@ -799,7 +799,9 @@ Return ONLY valid JSON in this format:
             "Invalid clarification classification."
         )
 
-    if not isinstance(result.get("response"), str):
+    if not isinstance(result.get("response"), str) or (
+        result["is_clarification"] and not result["response"].strip()
+    ):
         raise ValueError(
             "Invalid clarification response."
         )
