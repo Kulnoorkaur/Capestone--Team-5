@@ -20,6 +20,7 @@ import streamlit as st
 from app.chatbot.chat_llm import (
     extract_questionnaire_fields,
     generate_questionnaire_question,
+    handle_user_clarification,
 )
 
 from app.chatbot.questionnaire_bridge import QuestionnaireBridge
@@ -578,8 +579,14 @@ with chat_tab:
                 field_id
             )
 
+            display_label = (
+                label
+                if field_id.endswith(("-OTHER", "-DETAILS"))
+                else f"{field_id} — {label}"
+            )
+
             with st.expander(
-                f"{field_id} — {label}",
+                display_label,
                 expanded=True,
             ):
 
@@ -690,79 +697,151 @@ with chat_tab:
 
         st.session_state.intake_started = True
 
-        with st.spinner(
-            "Gemini is analyzing your response..."
-        ):
+        with st.spinner("Gemini is analyzing your response..."):
+
+            is_clarification = False
+            processing_succeeded = False
 
             try:
+                current_field = st.session_state.asked_field
 
-                extracted = extract_questionnaire_fields(
-                    user_message=user_message,
-                    confirmed_answers=bridge.get_product_profile(),
-                    target_field_id=st.session_state.asked_field,
-                    target_question=st.session_state.asked_question,
-                    questionnaire=st.session_state.active_questionnaire,
-                )
-
-                if extracted:
-
-                    st.session_state.field_suggestions.update(
-                        extracted
+                # First, identify clarification requests.
+                try:
+                    clarification = handle_user_clarification(
+                        user_message=user_message,
+                        current_field_id=current_field,
+                        current_question=st.session_state.asked_question,
+                        confirmed_answers=bridge.get_product_profile(),
                     )
+
+                    is_clarification = clarification["is_clarification"]
+
+                except Exception:
+                    # Local fallback if Gemini is unavailable.
+                    message_lower = user_message.lower()
+
+                    clarification_phrases = (
+                        "what is ",
+                        "what does ",
+                        "what do you mean",
+                        "what does it mean",
+                        "explain ",
+                        "give me an example",
+                        "can you clarify",
+                        "help me understand",
+                        "why are you asking",
+                    )
+
+                    is_clarification = any(
+                        phrase in message_lower
+                        for phrase in clarification_phrases
+                    )
+
+                    if is_clarification:
+                        field_id = current_field or ""
+                        parent_id = field_id.removesuffix("-OTHER")
+
+                        if parent_id == "PIP-006":
+                            response = (
+                                "Imaging modality means the type of "
+                                "medical imaging technology your "
+                                "software uses. Examples include CT, "
+                                "MRI, X-ray and ultrasound. For "
+                                "RetinaGuard AI, this would be "
+                                "digital retinal fundus photography."
+                            )
+                        else:
+                            label = bridge.get_field_label(parent_id)
+                            response = (
+                                f"{label} refers to the information "
+                                "this question is asking about. "
+                                "I can help explain it or provide "
+                                "an example if you need one."
+                            )
+
+                        add_message("assistant", response)
+                        processing_succeeded = True
+
+                # Handle clarification without extracting answers.
+                if is_clarification and not processing_succeeded:
 
                     add_message(
                         "assistant",
-                        (
-                            f"I identified {len(extracted)} "
-                            "potential questionnaire answer(s). "
-                            "Please review and confirm them below."
-                        ),
+                        clarification["response"],
                     )
 
-                elif st.session_state.asked_field is not None:
+                    processing_succeeded = True
 
-                    # Gemini did not capture the current field.
-                    # Ask for clarification without losing focus.
+                # Only extract questionnaire information when
+                # the user is actually providing product information.
+                elif not is_clarification:
 
-                    ask_question(
-                        st.session_state.asked_field,
-                        clarification=True,
+                    extracted = extract_questionnaire_fields(
+                        user_message=user_message,
+                        confirmed_answers=bridge.get_product_profile(),
+                        target_field_id=current_field,
+                        target_question=st.session_state.asked_question,
+                        questionnaire=st.session_state.active_questionnaire,
                     )
 
-                else:
+                    if extracted:
+                        st.session_state.field_suggestions.update(
+                            extracted
+                        )
 
-                    add_message(
-                        "assistant",
-                        (
-                            "I couldn't identify a supported "
-                            "questionnaire answer. Could you "
-                            "provide more details about your product?"
-                        ),
-                    )
+                        add_message(
+                            "assistant",
+                            (
+                                f"I identified {len(extracted)} "
+                                "potential questionnaire answer(s). "
+                                "Please review and confirm them below."
+                            ),
+                        )
+
+                    elif current_field is not None:
+                        ask_question(
+                            current_field,
+                            clarification=True,
+                        )
+
+                    else:
+                        add_message(
+                            "assistant",
+                            (
+                                "I couldn't identify a supported "
+                                "questionnaire answer. Could you "
+                                "provide more details about your product?"
+                            ),
+                        )
+
+                    processing_succeeded = True
 
             except Exception as error:
 
                 add_message(
                     "assistant",
                     (
-                        "I couldn't process that response. "
-                        "Please try again."
+                        "I'm temporarily unable to process that "
+                        "response. Your message has been retained. "
+                        "Please try again shortly."
                     ),
                 )
 
-                st.error(str(error))
+                st.warning(
+                    "The AI service is temporarily unavailable. "
+                    "Your confirmed answers have not been changed."
+                )
 
-        # After the initial product description,
-        # Gemini extracts suggestions first.
-        # If nothing was extracted and no question
-        # is active, schedule the next question.
+                print(f"Chat Buddy processing error: {error}")
 
-        if (
-            not st.session_state.field_suggestions
-            and st.session_state.asked_field is None
-        ):
-
-            schedule_next_question()
+            # Never advance after a clarification question.
+            if (
+                processing_succeeded
+                and not is_clarification
+                and not st.session_state.field_suggestions
+                and st.session_state.asked_field is None
+            ):
+                schedule_next_question()
 
         st.rerun()
 

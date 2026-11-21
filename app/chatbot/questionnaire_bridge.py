@@ -348,8 +348,15 @@ class QuestionnaireBridge:
         return labels
 
     def get_field_label(self, field_id):
-        return self.field_labels.get(field_id, field_id)
 
+        conditional_labels = {
+            "PIP-006-OTHER": "Other imaging modality (please specify)",
+        }
+
+        return conditional_labels.get(
+            field_id,
+            self.field_labels.get(field_id, field_id)
+        )
     def get_field_type(self, field_id):
 
         if field_id in MULTISELECT_FIELDS:
