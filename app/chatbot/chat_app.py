@@ -1,15 +1,28 @@
 """
 AI Regulatory Readiness Platform
-Context-Aware Gemini Chat Buddy Interface
+Gemini-Powered Chat Buddy — D2.1
+
+Features:
+- Natural-language product intake
+- Gemini field extraction
+- Developer confirmation
+- Context-aware questions
+- Reliable question progression
+- Clarification of unanswered fields
+- Conditional questionnaire fields
+- Manual questionnaire editing
+- JSON profile export
 """
 
+import json
 import streamlit as st
 
-from app.chatbot.chat_manager import ChatManager
 from app.chatbot.chat_llm import (
-    evaluate_chat_answer,
-    suggest_answer_from_context,
+    extract_questionnaire_fields,
+    generate_questionnaire_question,
 )
+
+from app.chatbot.questionnaire_bridge import QuestionnaireBridge
 
 
 # ============================================================
@@ -17,60 +30,62 @@ from app.chatbot.chat_llm import (
 # ============================================================
 
 st.set_page_config(
-    page_title="AI Regulatory Chat Buddy",
+    page_title="AI Regulatory Readiness Platform",
     page_icon="💬",
-    layout="centered",
+    layout="wide",
 )
 
-st.title("AI Regulatory Chat Buddy")
 
-st.caption(
-    "Your conversational guide to AI medical device regulatory readiness."
-)
-
-st.info(
-    "This assistant provides preliminary guidance only. "
-    "It does not establish regulatory compliance or approval."
+WELCOME = (
+    "Welcome! I'll help you build a regulatory readiness "
+    "profile for your imaging AI product.\n\n"
+    "To begin, describe your product, what it does, "
+    "and who will use it."
 )
 
 
 # ============================================================
-# SESSION INITIALIZATION
+# SESSION STATE
 # ============================================================
 
-if "chat_manager" not in st.session_state:
-    st.session_state.chat_manager = ChatManager()
+def initialize_session():
 
-if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = []
+    defaults = {
+        "questionnaire_bridge": QuestionnaireBridge,
+        "unified_messages": lambda: [
+            {
+                "role": "assistant",
+                "content": WELCOME,
+            }
+        ],
+        "field_suggestions": dict,
+        "asked_field": lambda: None,
+        "asked_question": lambda: None,
+        "intake_started": lambda: False,
+        "questionnaire_complete": lambda: False,
+        "needs_next_question": lambda: False,
+        "clarification_needed": lambda: False,
+        "editor_version": lambda: 0,
+    }
 
-if "pending_clarification" not in st.session_state:
-    st.session_state.pending_clarification = None
+    for name, factory in defaults.items():
 
-if "pending_answer" not in st.session_state:
-    st.session_state.pending_answer = None
-
-if "awaiting_confirmation" not in st.session_state:
-    st.session_state.awaiting_confirmation = False
-
-if "editing_suggestion" not in st.session_state:
-    st.session_state.editing_suggestion = False
-
-if "suggestion_checked_for" not in st.session_state:
-    st.session_state.suggestion_checked_for = None
+        if name not in st.session_state:
+            st.session_state[name] = factory()
 
 
-chat = st.session_state.chat_manager
+initialize_session()
+
+bridge = st.session_state.questionnaire_bridge
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# CONVERSATION HELPERS
 # ============================================================
 
 def add_message(role, content):
-    """Add a message to the conversation history."""
 
-    st.session_state.chat_messages.append(
+    st.session_state.unified_messages.append(
         {
             "role": role,
             "content": content,
@@ -78,335 +93,856 @@ def add_message(role, content):
     )
 
 
-def clear_pending_state():
-    """Clear temporary clarification and suggestion state."""
+def get_next_field():
 
-    st.session_state.pending_clarification = None
-    st.session_state.pending_answer = None
-    st.session_state.awaiting_confirmation = False
-    st.session_state.editing_suggestion = False
+    # Prioritize active conditional questions.
+    for field_id in bridge.get_active_conditional_fields():
+
+        if field_id not in bridge.answers:
+            return field_id
+
+    # Then check primary questionnaire fields.
+    for field_id in bridge.get_missing_fields():
+
+        if field_id not in bridge.answers:
+            return field_id
+
+    return None
 
 
-def present_current_question():
-    """
-    Present the next questionnaire question.
+def fallback_question(field_id):
 
-    If previous answers support a suggestion, ask the
-    user to confirm it rather than repeating the question.
-    """
+    label = bridge.get_field_label(field_id)
 
-    if chat.is_complete():
-        add_message(
-            "assistant",
-            "You've completed the initial product questionnaire! "
-            "Your confirmed responses are available below.",
+    options = bridge.get_field_options(field_id)
+
+    question = (
+        f"Could you provide information about "
+        f"**{label}** for your product?"
+    )
+
+    if options:
+
+        question += (
+            "\n\nAvailable options: "
+            + ", ".join(options)
         )
-        return
 
-    current_question = chat.get_current_question()
-    question_id = current_question["id"]
+    return question
 
-    # Avoid repeating the same suggestion check.
-    if st.session_state.suggestion_checked_for == question_id:
-        add_message(
-            "assistant",
-            current_question["question"],
-        )
-        return
 
-    st.session_state.suggestion_checked_for = question_id
+def ask_question(field_id, clarification=False):
 
-    previous_answers = chat.get_previous_answers()
+    if field_id is None:
 
-    if previous_answers:
+        st.session_state.asked_field = None
+        st.session_state.asked_question = None
+        st.session_state.needs_next_question = False
 
-        try:
-            suggestion_result = suggest_answer_from_context(
-                question=current_question["question"],
-                previous_answers=previous_answers,
+        if not st.session_state.questionnaire_complete:
+
+            add_message(
+                "assistant",
+                "All D2.1 questionnaire fields are complete, "
+                "including applicable conditional questions.\n\n"
+                "You can review your confirmed profile "
+                "or export it from the sidebar."
             )
 
-            if suggestion_result["can_suggest"]:
+            st.session_state.questionnaire_complete = True
 
-                suggested_answer = suggestion_result[
-                    "suggested_answer"
-                ]
+        return
 
-                chat.suggest_answer(
-                    question_id,
-                    suggested_answer,
-                )
+    label = bridge.get_field_label(field_id)
 
-                st.session_state.awaiting_confirmation = True
+    field_type = bridge.get_field_type(field_id)
 
-                add_message(
-                    "assistant",
-                    (
-                        f"**Based on what you've already shared, "
-                        f"I suggest the following answer:**\n\n"
-                        f"> {suggested_answer}\n\n"
-                        f"Would you like to confirm this answer "
-                        f"or change it?"
-                    ),
-                )
+    options = bridge.get_field_options(field_id)
 
-                return
+    try:
 
-        except Exception:
-            # A failed suggestion request should not prevent
-            # the user from answering the questionnaire.
-            pass
+        question = generate_questionnaire_question(
+            field_id=field_id,
+            field_label=label,
+            field_type=field_type,
+            field_options=options,
+            confirmed_answers=bridge.get_product_profile(),
+        )
+
+    except Exception:
+
+        question = fallback_question(field_id)
+
+    if clarification:
+
+        question = (
+            f"I still need to confirm **{label}**.\n\n"
+            f"{question}\n\n"
+            "You can also answer this question "
+            "using the Manual Questionnaire Editor."
+        )
+
+    st.session_state.asked_field = field_id
+
+    st.session_state.asked_question = question
+
+    st.session_state.questionnaire_complete = False
+
+    st.session_state.needs_next_question = False
+
+    st.session_state.clarification_needed = False
 
     add_message(
         "assistant",
-        current_question["question"],
+        question,
     )
 
 
 # ============================================================
-# START CONVERSATION
+# QUESTION PROGRESSION
 # ============================================================
 
-if not st.session_state.chat_messages:
-    present_current_question()
+def schedule_next_question():
+
+    """
+    Mark the conversation as ready to continue.
+
+    The actual question is generated on the next
+    Streamlit rerun.
+    """
+
+    st.session_state.needs_next_question = True
+
+
+def process_next_question():
+    """
+    Continue the conversation while respecting active
+    conditional fields and previously confirmed answers.
+    """
+
+    if not st.session_state.intake_started:
+        return
+
+    if st.session_state.field_suggestions:
+        return
+
+    if not st.session_state.needs_next_question:
+        return
+
+    current_field = st.session_state.asked_field
+
+    # Determine which conditional fields are currently active.
+    active_conditional_fields = set(
+        bridge.get_active_conditional_fields()
+    )
+
+    # If a conditional field is no longer active,
+    # clear it so the chatbot does not keep asking.
+    if (
+        current_field is not None
+        and current_field.endswith("-OTHER")
+        and current_field not in active_conditional_fields
+    ):
+        st.session_state.asked_field = None
+        st.session_state.asked_question = None
+        current_field = None
+
+    # Handle TRAINING-DETAILS separately because its
+    # field ID does not end with "-OTHER".
+    if (
+        current_field == "TRAINING-DETAILS"
+        and current_field not in active_conditional_fields
+    ):
+        st.session_state.asked_field = None
+        st.session_state.asked_question = None
+        current_field = None
+
+    # If the current question is still required and
+    # unanswered, request clarification.
+    if (
+        current_field is not None
+        and current_field not in bridge.answers
+    ):
+        ask_question(
+            current_field,
+            clarification=True,
+        )
+        return
+
+    # Otherwise, find the next active unanswered field.
+    next_field = get_next_field()
+
+    ask_question(next_field)
 
 
 # ============================================================
-# PROGRESS
+# ANSWER MANAGEMENT
 # ============================================================
 
-st.progress(chat.get_progress() / 100)
+def confirm_answer(field_id, value):
+
+    valid, error = bridge.save_answer(
+        field_id,
+        value,
+    )
+
+    if not valid:
+        return False, error
+
+    st.session_state.field_suggestions.pop(
+        field_id,
+        None,
+    )
+
+    st.session_state.editor_version += 1
+
+    # Schedule progression after the entire
+    # suggestion batch has been reviewed.
+    if not st.session_state.field_suggestions:
+
+        schedule_next_question()
+
+    return True, None
+
+
+def reject_answer(field_id):
+
+    st.session_state.field_suggestions.pop(
+        field_id,
+        None,
+    )
+
+    if not st.session_state.field_suggestions:
+
+        schedule_next_question()
+
+
+def reset_application():
+
+    keys = [
+        "questionnaire_bridge",
+        "unified_messages",
+        "field_suggestions",
+        "asked_field",
+        "asked_question",
+        "intake_started",
+        "questionnaire_complete",
+        "needs_next_question",
+        "clarification_needed",
+        "editor_version",
+    ]
+
+    for key in keys:
+
+        st.session_state.pop(
+            key,
+            None,
+        )
+
+    initialize_session()
+
+
+def restore_profile(uploaded_file):
+    """Validate first; replace session only when all answers are valid."""
+    try:
+        raw = uploaded_file.getvalue()
+        if len(raw) > 1_000_000:
+            return False, "File exceeds 1 MB."
+        profile = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        return False, f"Invalid JSON: {error}"
+    if not isinstance(profile, dict):
+        return False, "Expected a JSON object mapping field IDs to answers."
+    candidate = QuestionnaireBridge()
+    primary = set(candidate.field_labels)
+    conditional = {"PIP-006-OTHER", "PIP-007-OTHER", "PIP-016-OTHER",
+                   "PIP-017-OTHER", "PIP-022-OTHER", "TRAINING-DETAILS"}
+    unknown = set(profile) - primary - conditional
+    if unknown:
+        return False, "Unknown fields: " + ", ".join(sorted(unknown))
+    for field_id in candidate.field_labels:
+        if field_id in profile:
+            valid, error = candidate.save_answer(field_id, profile[field_id])
+            if not valid:
+                return False, f"{field_id}: {error}"
+    active = set(candidate.get_active_conditional_fields())
+    inactive = (set(profile) & conditional) - active
+    if inactive:
+        return False, "Inactive conditional fields in backup: " + ", ".join(sorted(inactive))
+    for field_id in sorted(active):
+        if field_id in profile:
+            valid, error = candidate.save_answer(field_id, profile[field_id])
+            if not valid:
+                return False, f"{field_id}: {error}"
+    st.session_state.questionnaire_bridge = candidate
+    st.session_state.field_suggestions = {}
+    st.session_state.asked_field = None
+    st.session_state.asked_question = None
+    st.session_state.intake_started = True
+    st.session_state.questionnaire_complete = False
+    st.session_state.needs_next_question = True
+    st.session_state.clarification_needed = False
+    st.session_state.editor_version += 1
+    st.session_state.unified_messages = [
+        {"role": "assistant", "content": WELCOME},
+        {"role": "assistant", "content": (
+            f"Restored {len(candidate.get_product_profile())} confirmed answers. "
+            "I'll continue with any remaining required questions."
+        )},
+    ]
+    return True, None
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+
+    st.title("Regulatory Profile")
+
+    confirmed = bridge.get_product_profile()
+
+    primary_fields = list(
+        bridge.field_labels
+    )
+
+    completed = sum(
+        1
+        for field_id in primary_fields
+        if field_id in confirmed
+    )
+
+    total = len(primary_fields)
+
+    st.subheader("Questionnaire Progress")
+
+    st.progress(
+        completed / total
+        if total
+        else 0
+    )
+
+    st.write(
+        f"**D2.1 Product Profile:** "
+        f"{completed}/{total}"
+    )
+
+    conditional_fields = (
+        bridge.get_active_conditional_fields()
+    )
+
+    if conditional_fields:
+
+        conditional_completed = sum(
+            1
+            for field_id in conditional_fields
+            if field_id in confirmed
+        )
+
+        st.caption(
+            f"Conditional fields: "
+            f"{conditional_completed}/"
+            f"{len(conditional_fields)}"
+        )
+
+    st.divider()
+
+    st.subheader("Additional Questionnaires")
+
+    st.write("D2.2 — AI Function: Not connected")
+
+    st.write(
+        "D2.3 — Algorithm Change Control: Not connected"
+    )
+
+    st.write(
+        "D2.4 — Dataset and Evidence: Not connected"
+    )
+
+    st.write(
+        "D2.5 — Risk Documentation: Not connected"
+    )
+
+    st.divider()
+
+    if confirmed:
+
+        st.download_button(
+            "Export Confirmed Profile",
+            data=json.dumps(
+                confirmed,
+                indent=2,
+                ensure_ascii=False,
+            ),
+            file_name="regulatory_product_profile.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+
+    st.subheader("Restore Saved Profile")
+    uploaded_profile = st.file_uploader(
+        "Choose a previously exported JSON profile",
+        type=["json"],
+        key="restore_profile_upload",
+    )
+    if st.button("Restore from JSON", disabled=uploaded_profile is None,
+                 use_container_width=True):
+        success, error = restore_profile(uploaded_profile)
+        if success:
+            st.rerun()
+        else:
+            st.error(error)
+
+    if st.button(
+        "Start New Assessment",
+        use_container_width=True,
+    ):
+
+        reset_application()
+
+        st.rerun()
+
+
+# ============================================================
+# MAIN INTERFACE
+# ============================================================
+
+st.title(
+    "AI Regulatory Readiness Platform"
+)
 
 st.caption(
-    f"Questionnaire progress: {chat.get_progress()}%"
+    "Gemini-Powered Regulatory Chat Buddy"
+)
+
+st.info(
+    "Preliminary regulatory readiness support only. "
+    "This application does not determine regulatory "
+    "approval or establish compliance."
+)
+
+
+chat_tab, manual_tab = st.tabs(
+    [
+        "Chat Buddy",
+        "Manual Questionnaire Editor",
+    ]
 )
 
 
 # ============================================================
-# DISPLAY CHAT HISTORY
+# AUTOMATIC QUESTION PROGRESSION
 # ============================================================
 
-for message in st.session_state.chat_messages:
-
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-
-# ============================================================
-# SUGGESTION CONFIRMATION
-# ============================================================
+# Process scheduled progression before rendering
+# the conversation so the next question appears
+# immediately after the final confirmation.
 
 if (
-    not chat.is_complete()
-    and st.session_state.awaiting_confirmation
+    st.session_state.needs_next_question
+    and not st.session_state.field_suggestions
 ):
 
-    current_question = chat.get_current_question()
+    process_next_question()
 
-    suggestion = chat.get_suggestion(
-        current_question["id"]
+
+# ============================================================
+# CHAT BUDDY
+# ============================================================
+
+with chat_tab:
+
+    st.subheader(
+        "Product Assessment Conversation"
     )
 
-    if suggestion:
+    # --------------------------------------------------------
+    # DISPLAY CONVERSATION
+    # --------------------------------------------------------
 
-        st.write("**Review the suggested answer:**")
+    for message in st.session_state.unified_messages:
 
-        st.info(suggestion)
+        with st.chat_message(
+            message["role"]
+        ):
 
-        col1, col2 = st.columns(2)
+            st.markdown(
+                message["content"]
+            )
 
-        with col1:
+    # --------------------------------------------------------
+    # REVIEW SUGGESTIONS
+    # --------------------------------------------------------
 
-            if st.button(
-                "Confirm this answer",
-                use_container_width=True,
+    if st.session_state.field_suggestions:
+
+        st.subheader(
+            "Review Extracted Information"
+        )
+
+        st.info(
+            "Gemini identified potential questionnaire "
+            "answers. Review and confirm only information "
+            "that accurately describes your product."
+        )
+
+        suggestions = (
+            st.session_state.field_suggestions
+        )
+
+        for field_id, proposed in list(
+            suggestions.items()
+        ):
+
+            label = bridge.get_field_label(
+                field_id
+            )
+
+            field_type = bridge.get_field_type(
+                field_id
+            )
+
+            with st.expander(
+                f"{field_id} — {label}",
+                expanded=True,
             ):
 
-                confirmed = chat.confirm_suggestion()
+                widget_key = (
+                    f"review_{field_id}_"
+                    f"{st.session_state.editor_version}"
+                )
 
-                if confirmed:
+                if field_type == "text":
 
-                    add_message(
-                        "user",
-                        "I confirm this answer.",
+                    edited = st.text_area(
+                        "Review answer",
+                        value=proposed,
+                        key=widget_key,
+                    )
+
+                elif field_type == "selectbox":
+
+                    options = (
+                        bridge.get_field_options(
+                            field_id
+                        )
+                    )
+
+                    edited = st.selectbox(
+                        "Review answer",
+                        options,
+                        index=(
+                            options.index(proposed)
+                            if proposed in options
+                            else 0
+                        ),
+                        key=widget_key,
+                    )
+
+                elif field_type == "multiselect":
+
+                    options = (
+                        bridge.get_field_options(
+                            field_id
+                        )
+                    )
+
+                    edited = st.multiselect(
+                        "Review answer",
+                        options,
+                        default=proposed,
+                        key=widget_key,
+                    )
+
+                else:
+                    continue
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+
+                    if st.button(
+                        "Confirm",
+                        key=f"confirm_{field_id}",
+                        use_container_width=True,
+                    ):
+
+                        valid, error = confirm_answer(
+                            field_id,
+                            edited,
+                        )
+
+                        if valid:
+
+                            st.rerun()
+
+                        else:
+
+                            st.error(error)
+
+                with col2:
+
+                    if st.button(
+                        "Reject",
+                        key=f"reject_{field_id}",
+                        use_container_width=True,
+                    ):
+
+                        reject_answer(
+                            field_id
+                        )
+
+                        st.rerun()
+
+    # --------------------------------------------------------
+    # CHAT INPUT
+    # --------------------------------------------------------
+
+    user_message = st.chat_input(
+        "Describe your product or answer the question...",
+        disabled=bool(
+            st.session_state.field_suggestions
+        ),
+    )
+
+    if user_message:
+
+        add_message(
+            "user",
+            user_message,
+        )
+
+        st.session_state.intake_started = True
+
+        with st.spinner(
+            "Gemini is analyzing your response..."
+        ):
+
+            try:
+
+                extracted = extract_questionnaire_fields(
+                    user_message=user_message,
+                    confirmed_answers=bridge.get_product_profile(),
+                    target_field_id=st.session_state.asked_field,
+                    target_question=st.session_state.asked_question,
+                )
+
+                if extracted:
+
+                    st.session_state.field_suggestions.update(
+                        extracted
                     )
 
                     add_message(
                         "assistant",
-                        "Thank you. I've recorded your "
-                        "confirmed answer.",
+                        (
+                            f"I identified {len(extracted)} "
+                            "potential questionnaire answer(s). "
+                            "Please review and confirm them below."
+                        ),
                     )
 
-                    clear_pending_state()
+                elif st.session_state.asked_field is not None:
 
-                    present_current_question()
+                    # Gemini did not capture the current field.
+                    # Ask for clarification without losing focus.
 
-                    st.rerun()
+                    ask_question(
+                        st.session_state.asked_field,
+                        clarification=True,
+                    )
 
-        with col2:
+                else:
 
-            if st.button(
-                "I'd like to change it",
-                use_container_width=True,
-            ):
-
-                chat.reject_suggestion()
-
-                st.session_state.awaiting_confirmation = False
-                st.session_state.editing_suggestion = True
-
-                add_message(
-                    "user",
-                    "I'd like to change that answer.",
-                )
-
-                add_message(
-                    "assistant",
-                    (
-                        "No problem. Please provide your "
-                        "preferred answer to this question:\n\n"
-                        + current_question["question"]
-                    ),
-                )
-
-                st.rerun()
-
-
-# ============================================================
-# HANDLE USER ANSWERS
-# ============================================================
-
-if (
-    not chat.is_complete()
-    and not st.session_state.awaiting_confirmation
-):
-
-    user_answer = st.chat_input(
-        "Type your answer here..."
-    )
-
-    if user_answer:
-
-        current_question = chat.get_current_question()
-
-        add_message(
-            "user",
-            user_answer,
-        )
-
-        # Combine an original answer with any clarification.
-        if st.session_state.pending_clarification:
-
-            combined_answer = (
-                st.session_state.pending_answer
-                + "\nAdditional clarification: "
-                + user_answer
-            )
-
-        else:
-            combined_answer = user_answer
-
-        with st.spinner("Thinking..."):
-
-            try:
-
-                result = evaluate_chat_answer(
-                    question=current_question["question"],
-                    answer=combined_answer,
-                    previous_answers=chat.get_previous_answers(),
-                )
+                    add_message(
+                        "assistant",
+                        (
+                            "I couldn't identify a supported "
+                            "questionnaire answer. Could you "
+                            "provide more details about your product?"
+                        ),
+                    )
 
             except Exception as error:
 
                 add_message(
                     "assistant",
                     (
-                        "I'm having trouble evaluating that "
-                        "answer right now. Please try again."
+                        "I couldn't process that response. "
+                        "Please try again."
                     ),
                 )
 
-                st.error(
-                    "Gemini is temporarily unavailable."
-                )
+                st.error(str(error))
 
-                st.exception(error)
+        # After the initial product description,
+        # Gemini extracts suggestions first.
+        # If nothing was extracted and no question
+        # is active, schedule the next question.
 
-                st.stop()
+        if (
+            not st.session_state.field_suggestions
+            and st.session_state.asked_field is None
+        ):
 
-        assistant_message = result["message"]
-
-        if result["needs_clarification"]:
-
-            st.session_state.pending_clarification = (
-                result["clarification_question"]
-            )
-
-            st.session_state.pending_answer = combined_answer
-
-            add_message(
-                "assistant",
-                (
-                    assistant_message
-                    + "\n\n**Follow-up question:** "
-                    + result["clarification_question"]
-                ),
-            )
-
-        else:
-
-            saved = chat.save_answer(combined_answer)
-
-            if saved:
-
-                clear_pending_state()
-
-                add_message(
-                    "assistant",
-                    assistant_message,
-                )
-
-                present_current_question()
+            schedule_next_question()
 
         st.rerun()
 
 
 # ============================================================
-# COMPLETED QUESTIONNAIRE
+# MANUAL QUESTIONNAIRE EDITOR
 # ============================================================
 
-if chat.is_complete():
+with manual_tab:
 
-    st.success(
-        "Initial product questionnaire completed!"
+    st.header(
+        "D2.1 Product and Intended-Use Profile"
     )
 
-    with st.expander(
-        "View Your Confirmed Product Profile",
-        expanded=True,
-    ):
+    st.caption(
+        "Use this section to manually complete "
+        "or correct questionnaire answers."
+    )
 
-        st.json(
-            chat.get_product_profile()
+    confirmed = bridge.get_product_profile()
+
+    manual_fields = list(
+        bridge.field_labels.items()
+    )
+
+    # Include active conditional fields.
+
+    for field_id in bridge.get_active_conditional_fields():
+
+        if field_id not in bridge.field_labels:
+
+            manual_fields.append(
+                (
+                    field_id,
+                    bridge.get_field_label(field_id),
+                )
+            )
+
+    for field_id, label in manual_fields:
+
+        field_type = bridge.get_field_type(
+            field_id
         )
+
+        current = confirmed.get(
+            field_id
+        )
+
+        with st.expander(
+            f"{field_id} — {label}"
+        ):
+
+            widget_key = (
+                f"manual_{field_id}_"
+                f"{st.session_state.editor_version}"
+            )
+
+            if field_type == "text":
+
+                value = st.text_area(
+                    label,
+                    value=current or "",
+                    key=widget_key,
+                )
+
+            elif field_type == "selectbox":
+
+                options = (
+                    bridge.get_field_options(
+                        field_id
+                    )
+                )
+
+                value = st.selectbox(
+                    label,
+                    ["Select an option"] + options,
+                    index=(
+                        options.index(current) + 1
+                        if current in options
+                        else 0
+                    ),
+                    key=widget_key,
+                )
+
+            elif field_type == "multiselect":
+
+                options = (
+                    bridge.get_field_options(
+                        field_id
+                    )
+                )
+
+                value = st.multiselect(
+                    label,
+                    options,
+                    default=current or [],
+                    key=widget_key,
+                )
+
+            else:
+                continue
+
+            if st.button(
+                "Save Answer",
+                key=f"save_manual_{field_id}",
+            ):
+
+                if value == "Select an option":
+
+                    st.warning(
+                        "Please select an answer."
+                    )
+
+                else:
+
+                    valid, error = bridge.save_answer(
+                        field_id,
+                        value,
+                    )
+
+                    if valid:
+
+                        st.session_state.editor_version += 1
+
+                        st.session_state.field_suggestions.pop(
+                            field_id,
+                            None,
+                        )
+
+                        # Continue the conversation when
+                        # all suggestions are resolved.
+
+                        if (
+                            not st.session_state.field_suggestions
+                            and st.session_state.intake_started
+                        ):
+
+                            schedule_next_question()
+
+                        st.rerun()
+
+                    else:
+
+                        st.error(error)
 
 
 # ============================================================
-# RESET CONVERSATION
+# CONFIRMED PROFILE
 # ============================================================
 
 st.divider()
 
-if st.button("Start New Conversation"):
+with st.expander(
+    "View Confirmed D2.1 Profile"
+):
 
-    chat.reset()
-
-    st.session_state.chat_messages = []
-
-    clear_pending_state()
-
-    st.session_state.suggestion_checked_for = None
-
-    present_current_question()
-
-    st.rerun()
+    st.json(
+        bridge.get_product_profile()
+    )
