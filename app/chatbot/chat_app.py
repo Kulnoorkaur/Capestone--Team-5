@@ -23,6 +23,7 @@ from app.chatbot.chat_llm import (
     handle_user_clarification,
 )
 
+from app.chatbot.d23_chat import render_d23_chat
 from app.chatbot.questionnaire_bridge import CONDITIONAL_FIELDS, QuestionnaireBridge
 
 
@@ -490,6 +491,11 @@ def reset_application():
         "editor_version",
         "review_batch_version",
         "active_questionnaire",
+        "d23_mode",
+        "d23_adapter",
+        "d23_active_algorithm_id",
+        "d23_answer_revision",
+        "d23-algorithm-picker",
     ]
 
     for key in keys:
@@ -545,6 +551,7 @@ def restore_profile(uploaded_file):
     st.session_state.asked_question = None
     st.session_state.intake_started = True
     st.session_state.questionnaire_complete = False
+    st.session_state.d23_mode = False
     st.session_state.needs_next_question = True
     st.session_state.clarification_needed = False
     st.session_state.editor_version += 1
@@ -588,7 +595,7 @@ with st.sidebar:
     st.subheader("Additional Questionnaires")
 
     st.write(
-        "D2.3 — Algorithm Change Control: Not connected"
+        "D2.3 — Algorithm Change Control: available after D2.2"
     )
 
     st.write(
@@ -677,6 +684,7 @@ chat_tab, manual_tab = st.tabs(
 if (
     st.session_state.needs_next_question
     and not st.session_state.field_suggestions
+    and not st.session_state.get("d23_mode", False)
 ):
 
     process_next_question()
@@ -686,7 +694,7 @@ if (
 # CHAT BUDDY
 # ============================================================
 
-with chat_tab:
+def render_d21_d22_chat():
 
     st.subheader(
         "Product Assessment Conversation"
@@ -942,6 +950,19 @@ with chat_tab:
                 st.session_state.retryable_turn = None
 
         st.rerun()
+
+
+with chat_tab:
+    if st.session_state.get("d23_mode", False):
+        if st.button("Back to D2.1 and D2.2"):
+            st.session_state.d23_mode = False
+            st.rerun()
+        render_d23_chat()
+    else:
+        if st.session_state.questionnaire_complete and st.button("Continue to D2.3"):
+            st.session_state.d23_mode = True
+            st.rerun()
+        render_d21_d22_chat()
 
 
 # ============================================================
