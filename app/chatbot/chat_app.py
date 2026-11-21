@@ -1,6 +1,6 @@
 """
 AI Regulatory Readiness Platform
-Gemini-Powered Chat Buddy — D2.1
+Gemini-Powered Chat Buddy — D2.1 and D2.2
 
 Features:
 - Natural-language product intake
@@ -66,6 +66,7 @@ def initialize_session():
         "needs_next_question": lambda: False,
         "clarification_needed": lambda: False,
         "editor_version": lambda: 0,
+        "active_questionnaire": lambda: "D2.1",
     }
 
     for name, factory in defaults.items():
@@ -93,20 +94,35 @@ def add_message(role, content):
     )
 
 
+QUESTIONNAIRES = ("D2.1", "D2.2")
+QUESTIONNAIRE_NAMES = {
+    "D2.1": "Product and Intended-Use Profile",
+    "D2.2": "AI Function and Clinical Workflow",
+}
+
+
+def questionnaire_for_field(field_id):
+    if field_id and field_id.startswith("AIF-"):
+        return "D2.2"
+    return "D2.1"
+
+
+def pending_fields(questionnaire):
+    """Conditional fields first, followed by required primary fields."""
+    return [
+        field_id for field_id in (
+            bridge.get_active_conditional_fields(questionnaire)
+            + bridge.get_missing_fields(questionnaire)
+        ) if field_id not in bridge.answers
+    ]
+
+
 def get_next_field():
-
-    # Prioritize active conditional questions.
-    for field_id in bridge.get_active_conditional_fields():
-
-        if field_id not in bridge.answers:
-            return field_id
-
-    # Then check primary questionnaire fields.
-    for field_id in bridge.get_missing_fields():
-
-        if field_id not in bridge.answers:
-            return field_id
-
+    for questionnaire in QUESTIONNAIRES:
+        pending = pending_fields(questionnaire)
+        if pending:
+            st.session_state.active_questionnaire = questionnaire
+            return pending[0]
     return None
 
 
@@ -143,7 +159,7 @@ def ask_question(field_id, clarification=False):
 
             add_message(
                 "assistant",
-                "All D2.1 questionnaire fields are complete, "
+                "All D2.1 and D2.2 questionnaire fields are complete, "
                 "including applicable conditional questions.\n\n"
                 "You can review your confirmed profile "
                 "or export it from the sidebar."
@@ -153,6 +169,7 @@ def ask_question(field_id, clarification=False):
 
         return
 
+    st.session_state.active_questionnaire = questionnaire_for_field(field_id)
     label = bridge.get_field_label(field_id)
 
     field_type = bridge.get_field_type(field_id)
@@ -231,31 +248,15 @@ def process_next_question():
 
     current_field = st.session_state.asked_field
 
-    # Determine which conditional fields are currently active.
-    active_conditional_fields = set(
-        bridge.get_active_conditional_fields()
-    )
-
-    # If a conditional field is no longer active,
-    # clear it so the chatbot does not keep asking.
-    if (
-        current_field is not None
-        and current_field.endswith("-OTHER")
-        and current_field not in active_conditional_fields
-    ):
-        st.session_state.asked_field = None
-        st.session_state.asked_question = None
-        current_field = None
-
-    # Handle TRAINING-DETAILS separately because its
-    # field ID does not end with "-OTHER".
-    if (
-        current_field == "TRAINING-DETAILS"
-        and current_field not in active_conditional_fields
-    ):
-        st.session_state.asked_field = None
-        st.session_state.asked_question = None
-        current_field = None
+    # Drop a previously asked conditional question if it is no longer active.
+    from app.chatbot.questionnaire_bridge import CONDITIONAL_FIELDS
+    all_conditional = set(CONDITIONAL_FIELDS)
+    if current_field in all_conditional:
+        active = set(bridge.get_active_conditional_fields(questionnaire_for_field(current_field)))
+        if current_field not in active:
+            st.session_state.asked_field = None
+            st.session_state.asked_question = None
+            current_field = None
 
     # If the current question is still required and
     # unanswered, request clarification.
@@ -330,6 +331,7 @@ def reset_application():
         "needs_next_question",
         "clarification_needed",
         "editor_version",
+        "active_questionnaire",
     ]
 
     for key in keys:
@@ -354,18 +356,21 @@ def restore_profile(uploaded_file):
     if not isinstance(profile, dict):
         return False, "Expected a JSON object mapping field IDs to answers."
     candidate = QuestionnaireBridge()
-    primary = set(candidate.field_labels)
-    conditional = {"PIP-006-OTHER", "PIP-007-OTHER", "PIP-016-OTHER",
-                   "PIP-017-OTHER", "PIP-022-OTHER", "TRAINING-DETAILS"}
+    from app.chatbot.questionnaire_bridge import QUESTIONNAIRE_FIELDS, CONDITIONAL_FIELDS
+    primary = {field_id for fields in QUESTIONNAIRE_FIELDS.values() for field_id in fields}
+    conditional = set(CONDITIONAL_FIELDS)
     unknown = set(profile) - primary - conditional
     if unknown:
         return False, "Unknown fields: " + ", ".join(sorted(unknown))
-    for field_id in candidate.field_labels:
+    # Restore parents before children, irrespective of JSON key order.
+    for field_id in sorted(primary):
         if field_id in profile:
             valid, error = candidate.save_answer(field_id, profile[field_id])
             if not valid:
                 return False, f"{field_id}: {error}"
-    active = set(candidate.get_active_conditional_fields())
+    active = set()
+    for questionnaire in QUESTIONNAIRES:
+        active.update(candidate.get_active_conditional_fields(questionnaire))
     inactive = (set(profile) & conditional) - active
     if inactive:
         return False, "Inactive conditional fields in backup: " + ", ".join(sorted(inactive))
@@ -403,54 +408,24 @@ with st.sidebar:
 
     confirmed = bridge.get_product_profile()
 
-    primary_fields = list(
-        bridge.field_labels
-    )
-
-    completed = sum(
-        1
-        for field_id in primary_fields
-        if field_id in confirmed
-    )
-
-    total = len(primary_fields)
-
     st.subheader("Questionnaire Progress")
-
-    st.progress(
-        completed / total
-        if total
-        else 0
-    )
-
-    st.write(
-        f"**D2.1 Product Profile:** "
-        f"{completed}/{total}"
-    )
-
-    conditional_fields = (
-        bridge.get_active_conditional_fields()
-    )
-
-    if conditional_fields:
-
-        conditional_completed = sum(
-            1
-            for field_id in conditional_fields
-            if field_id in confirmed
-        )
-
-        st.caption(
-            f"Conditional fields: "
-            f"{conditional_completed}/"
-            f"{len(conditional_fields)}"
-        )
+    overall_completed = overall_total = 0
+    for questionnaire in QUESTIONNAIRES:
+        progress = bridge.get_questionnaire_progress(questionnaire)
+        overall_completed += progress["completed"]
+        overall_total += progress["total"]
+        st.write(f"**{questionnaire} — {QUESTIONNAIRE_NAMES[questionnaire]}:** "
+                 f"{progress['completed']}/{progress['total']}")
+        conditional_fields = bridge.get_active_conditional_fields(questionnaire)
+        if conditional_fields:
+            conditional_completed = sum(fid in confirmed for fid in conditional_fields)
+            st.caption(f"Conditional: {conditional_completed}/{len(conditional_fields)}")
+    st.progress(overall_completed / overall_total if overall_total else 0)
+    st.caption(f"Overall primary questions: {overall_completed}/{overall_total}")
 
     st.divider()
 
     st.subheader("Additional Questionnaires")
-
-    st.write("D2.2 — AI Function: Not connected")
 
     st.write(
         "D2.3 — Algorithm Change Control: Not connected"
@@ -475,7 +450,7 @@ with st.sidebar:
                 indent=2,
                 ensure_ascii=False,
             ),
-            file_name="regulatory_product_profile.json",
+            file_name="regulatory_d21_d22_profile.json",
             mime="application/json",
             use_container_width=True,
         )
@@ -726,6 +701,7 @@ with chat_tab:
                     confirmed_answers=bridge.get_product_profile(),
                     target_field_id=st.session_state.asked_field,
                     target_question=st.session_state.asked_question,
+                    questionnaire=st.session_state.active_questionnaire,
                 )
 
                 if extracted:
@@ -797,9 +773,7 @@ with chat_tab:
 
 with manual_tab:
 
-    st.header(
-        "D2.1 Product and Intended-Use Profile"
-    )
+    st.header("D2.1 and D2.2 Questionnaire Editor")
 
     st.caption(
         "Use this section to manually complete "
@@ -808,22 +782,13 @@ with manual_tab:
 
     confirmed = bridge.get_product_profile()
 
-    manual_fields = list(
-        bridge.field_labels.items()
-    )
-
-    # Include active conditional fields.
-
-    for field_id in bridge.get_active_conditional_fields():
-
-        if field_id not in bridge.field_labels:
-
-            manual_fields.append(
-                (
-                    field_id,
-                    bridge.get_field_label(field_id),
-                )
-            )
+    from app.chatbot.questionnaire_bridge import QUESTIONNAIRE_FIELDS
+    manual_fields = []
+    for questionnaire in QUESTIONNAIRES:
+        for field_id in QUESTIONNAIRE_FIELDS[questionnaire]:
+            manual_fields.append((field_id, bridge.get_field_label(field_id)))
+        for field_id in bridge.get_active_conditional_fields(questionnaire):
+            manual_fields.append((field_id, bridge.get_field_label(field_id)))
 
     for field_id, label in manual_fields:
 
@@ -940,7 +905,7 @@ with manual_tab:
 st.divider()
 
 with st.expander(
-    "View Confirmed D2.1 Profile"
+    "View Confirmed D2.1 and D2.2 Profile"
 ):
 
     st.json(

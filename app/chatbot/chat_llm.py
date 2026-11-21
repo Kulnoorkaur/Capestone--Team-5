@@ -339,9 +339,10 @@ def extract_questionnaire_fields(
     confirmed_answers=None,
     target_field_id=None,
     target_question=None,
+    questionnaire="D2.1",
 ):
     """
-    Extract candidate D2.1 questionnaire field values
+    Extract candidate D2.1 or D2.2 questionnaire field values
     from a natural-language user message.
 
     Returns validated suggestions, NOT confirmed answers.
@@ -364,11 +365,35 @@ def extract_questionnaire_fields(
 
     confirmed_answers = confirmed_answers or {}
 
+    if questionnaire not in ("D2.1", "D2.2"):
+        raise ValueError("questionnaire must be D2.1 or D2.2.")
+
     bridge = QuestionnaireBridge()
 
+    # Only expose fields belonging to the active questionnaire.
+    primary_ids = bridge.get_missing_fields(questionnaire)
+    # Include already-confirmed primary fields in the definitions too,
+    # so the model can interpret context while never overwriting them.
+    prefix = "PIP-" if questionnaire == "D2.1" else "AIF-"
+    primary_ids = [
+        field_id for field_id in bridge.field_labels
+        if field_id.startswith(prefix) and
+        field_id.split("-")[-1].isdigit()
+    ]
+    active_conditionals = []
+    from app.chatbot.questionnaire_bridge import CONDITIONAL_FIELDS
+    for child_id, (parent_id, trigger) in CONDITIONAL_FIELDS.items():
+        parent_value = confirmed_answers.get(parent_id)
+        if bridge._condition_matches(parent_value, trigger):
+            if parent_id.startswith(prefix):
+                active_conditionals.append(child_id)
+
+    allowed_fields = set(primary_ids) | set(active_conditionals)
+    # Never extract an inactive conditional field, even if the model suggests it.
     field_definitions = {}
 
-    for field_id, label in bridge.field_labels.items():
+    for field_id in sorted(allowed_fields):
+        label = bridge.get_field_label(field_id)
         field_definitions[field_id] = {
             "label": label,
             "type": bridge.get_field_type(field_id),
@@ -381,8 +406,8 @@ def extract_questionnaire_fields(
 You are extracting structured information about an
 imaging-informed medical AI product.
 
-The user is completing Deliverable 2.1:
-Product and Intended-Use Profile.
+The user is completing {questionnaire}:
+{"Product and Intended-Use Profile" if questionnaire == "D2.1" else "AI Function and Clinical Workflow"}.
 
 USER MESSAGE:
 {user_message}
@@ -425,7 +450,7 @@ IMPORTANT RULES:
    only accepted questionnaire options.
 
 8. Do not include fields that cannot be supported
-   by the user's message.
+   by the user's message. Only return field IDs in the provided definitions.
 
 9. Do not infer regulatory classification,
    approval status, or compliance.
@@ -443,15 +468,9 @@ IMPORTANT RULES:
     interpreted in light of the current question, but only
     when their meaning is unambiguous.
 
-Example output:
+Example output (use only fields available in the definitions):
 
-{{
-    "PIP-001": "LungScan AI",
-    "PIP-005": "Lungs",
-    "PIP-006": "CT",
-    "PIP-007": ["Radiologist"],
-    "PIP-022": ["Image analysis", "Detection"]
-}}
+{{"{ "PIP-006" if questionnaire == "D2.1" else "AIF-001" }": {json.dumps("CT" if questionnaire == "D2.1" else ["Medical images"])}}}
 
 Return ONLY valid JSON.
 """
@@ -461,7 +480,7 @@ Return ONLY valid JSON.
         contents=extraction_prompt,
         config=types.GenerateContentConfig(
             system_instruction=(
-                "Extract explicitly supported D2.1 product facts into a JSON "
+                "Extract explicitly supported D2.1 or D2.2 product facts into a JSON "
                 "object mapping field IDs to candidate values. Prioritize "
                 "the currently asked field when supported. Never invent "
                 "facts or make regulatory determinations."
@@ -493,6 +512,9 @@ Return ONLY valid JSON.
 
     for field_id, value in extracted.items():
 
+        if field_id not in allowed_fields:
+            continue
+
         # Never overwrite previously confirmed information.
         if field_id in confirmed_answers:
             continue
@@ -518,7 +540,7 @@ def generate_questionnaire_question(
     field_options=None,
     confirmed_answers=None,
 ):
-    """Generate one context-aware question for an unanswered D2.1 field."""
+    """Generate one context-aware question for an unanswered D2.1/D2.2 field."""
 
     if not isinstance(field_id, str) or not field_id.strip():
         raise ValueError("A valid questionnaire field ID is required.")
@@ -533,9 +555,20 @@ def generate_questionnaire_question(
         raise ValueError("field_options must be a list.")
     if not isinstance(confirmed_answers, dict):
         raise ValueError("confirmed_answers must be a dictionary.")
-        field_specific_instruction = ""
     field_specific_instruction = ""
     
+    if field_id.endswith("-OTHER"):
+        parent_id = field_id.removesuffix("-OTHER")
+        field_specific_instruction = (
+            f"The user selected Other for {parent_id}. Ask them to specify "
+            "what the other option is, without repeating the parent question."
+        )
+    elif field_id.endswith("-DETAILS"):
+        field_specific_instruction = (
+            "This is a conditional follow-up. Ask for the specific details "
+            "described by the field label, not another Yes/No answer."
+        )
+
     if field_id == "TRAINING-DETAILS":
         field_specific_instruction = (
             "This field asks about SPECIALIZED TRAINING REQUIRED FOR HUMAN USERS "
