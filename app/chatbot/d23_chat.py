@@ -1,8 +1,9 @@
-"""Deterministic, algorithm-scoped conversation for D2.3."""
+"""Algorithm-scoped conversation and confirmation for D2.3."""
 
 import streamlit as st
 
 from app.chatbot.d23_adapter import D23AnswerAdapter
+from app.chatbot.chat_llm import extract_d23_candidates
 from app.deliverable_2.questionnaires.algorithm_change_control import (
     BY_ID,
     FRAMEWORKS,
@@ -47,12 +48,124 @@ def _answer_input(definition, current, key):
     }
 
 
+def _answer_metadata(field_id, value, key, *, details="", evidence=""):
+    if needs_details(field_id, value):
+        st.caption("An explanation is required for this answer.")
+    details = st.text_area("Explanation", value=details, key=f"{key}-details")
+    evidence = st.text_input(
+        "Document evidence reference", value=evidence, key=f"{key}-evidence",
+        help="Enter the supporting document ID, version, and page or section.",
+    )
+    return details, evidence
+
+
+def _evidence_key(value):
+    return " ".join(value.casefold().split())
+
+
+def _submit_turn(conversation, algorithm_id, algorithm, active, field_id, message, other_names):
+    conversation["turns"].append(message)
+    source_id = str(len(conversation["turns"]))
+    try:
+        suggestions, clarification = extract_d23_candidates(
+            message, algorithm_id=algorithm_id, algorithm=algorithm, source_id=source_id,
+            active_fields=active, target_field=field_id,
+            other_algorithm_names=other_names,
+        )
+    except Exception:
+        conversation["notice"] = "Gemini could not process that answer. Your message is retained. You can answer using the controls below."
+        return
+    for field, candidate in suggestions.items():
+        rejected = conversation["rejected"].get(field, ())
+        if any(
+            _evidence_key(message) == prior_message
+            or (not candidate["correction"] and _evidence_key(candidate["quote"]) == prior_quote)
+            for prior_message, prior_quote in rejected
+        ):
+            continue
+        conversation["candidates"][field] = candidate
+    conversation["notice"] = clarification or (
+        "" if suggestions else "I couldn't identify a supported answer. Could you clarify the detail for this algorithm?"
+    )
+
+
+def _active_suggestions(adapter, algorithm_id, active, conversation):
+    suggestions = {}
+    candidates = conversation["candidates"]
+    for field_id in active:
+        candidate = candidates.get(field_id)
+        if not candidate or candidate["algorithm_id"] != algorithm_id:
+            continue
+        try:
+            adapter.check_answer(algorithm_id, field_id, candidate["value"], details=candidate["details"])
+        except ValueError:
+            candidates.pop(field_id)
+        else:
+            suggestions[field_id] = candidate
+    return suggestions
+
+
+def _save_answer(adapter, algorithm_id, field_id, value, details, evidence, conversation, quote=""):
+    active = set(adapter.active_field_ids(algorithm_id))
+    adapter.save_answer(algorithm_id, field_id, value, details=details, evidence=evidence, source_quote=quote)
+    obsolete = active - set(adapter.active_field_ids(algorithm_id)) | {field_id}
+    for removed in obsolete:
+        conversation["candidates"].pop(removed, None)
+    conversation["skipped"].difference_update(obsolete)
+    st.session_state.d23_answer_revision += 1
+    st.rerun()
+
+
+def _dismiss_candidate(conversation, field_id, candidate, *, skip=False):
+    message = conversation["turns"][int(candidate["source_id"]) - 1]
+    conversation["rejected"].setdefault(field_id, set()).add(
+        (_evidence_key(message), _evidence_key(candidate["quote"]))
+    )
+    conversation["candidates"].pop(field_id)
+    if skip:
+        conversation["skipped"].add(field_id)
+    st.rerun()
+
+
+def _same_value(left, right):
+    if isinstance(left, dict) and isinstance(right, dict):
+        return {k: v for k, v in left.items() if v is not None} == {
+            k: v for k, v in right.items() if v is not None
+        }
+    return left == right
+
+
+def _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggestions):
+    st.subheader("Review extracted D2.3 answers")
+    for field_id, candidate in suggestions.items():
+        definition = BY_ID[field_id]
+        key = f"d23-review-{algorithm_id}-{candidate['source_id']}-{field_id}"
+        with st.expander(f"{field_id} — {definition['label']}", expanded=True):
+            st.text(_identity(algorithm))
+            st.text(f"Source turn {candidate['source_id']}: {candidate['quote']}")
+            value = _answer_input(definition, candidate["value"], key)
+            details, evidence = _answer_metadata(field_id, value, key, details=candidate["details"])
+            confirm, reject, skip = st.columns(3)
+            if confirm.button("Confirm suggestion", key=f"{key}-confirm"):
+                quote = candidate["quote"] if _same_value(value, candidate["value"]) else ""
+                try:
+                    _save_answer(adapter, algorithm_id, field_id, value, details, evidence, conversation, quote)
+                except ValueError as error:
+                    st.error(str(error))
+            if reject.button("Reject suggestion", key=f"{key}-reject"):
+                _dismiss_candidate(conversation, field_id, candidate)
+            if skip.button("Skip suggestion", key=f"{key}-skip"):
+                _dismiss_candidate(conversation, field_id, candidate, skip=True)
+
+
 def render_d23_chat():
     state = st.session_state
     if "d23_adapter" not in state:
         state.d23_adapter = D23AnswerAdapter()
         state.d23_answer_revision = 0
     adapter = state.d23_adapter
+    if "d23_conversations" not in state:
+        state.d23_conversations = {}
 
     st.subheader("D2.3 — Algorithm Change Control")
     with st.chat_message("assistant"):
@@ -84,6 +197,9 @@ def render_d23_chat():
     )
     state.d23_active_algorithm_id = algorithm_id
     algorithm = adapter.get_algorithm(algorithm_id)
+    conversation = state.d23_conversations.setdefault(algorithm_id, {
+        "turns": [], "candidates": {}, "rejected": {}, "skipped": set(), "notice": "",
+    })
 
     with st.expander("Edit algorithm name or version"):
         with st.form(f"d23-identity-{algorithm_id}"):
@@ -96,6 +212,9 @@ def render_d23_chat():
             except ValueError as error:
                 st.error(str(error))
             else:
+                if (name, version) != (algorithm["name"], algorithm["version"]):
+                    conversation["candidates"].clear()
+                    conversation["notice"] = ""
                 st.rerun()
 
     answers = algorithm["answers"]
@@ -113,19 +232,47 @@ def render_d23_chat():
             st.write(f"{issue['id']} — {issue['problem']}")
         for flag in record["flags"]:
             st.write(f"{', '.join(flag['fields'])} — {flag['message']}")
+        editable = [field for field in active if field in answers or field in conversation["skipped"]]
         edit = st.selectbox(
-            "Revise a confirmed answer",
-            [None, *answers],
+            "Revise a confirmed or skipped answer",
+            [None, *editable],
             format_func=lambda field_id: (
                 f"{field_id} — {BY_ID[field_id]['label']}" if field_id else "Continue with next question"
             ),
             key=f"d23-revise-{algorithm_id}-{revision}",
         )
 
-    field_id = edit or (pending[0] if pending else None)
+    field_id = edit or next((field for field in pending if field not in conversation["skipped"]), None)
+    suggestions = _active_suggestions(adapter, algorithm_id, active, conversation)
+    for message in conversation["turns"][-6:]:
+        with st.chat_message("user"):
+            st.text(message)
+    if conversation["notice"]:
+        with st.chat_message("assistant"):
+            st.write(conversation["notice"])
+    message = st.chat_input(
+        "Describe this algorithm or answer in your own words",
+        key=f"d23-chat-input-{algorithm_id}", disabled=bool(suggestions),
+    )
+    if message and message.strip() and not suggestions:
+        other_names = [
+            adapter.get_algorithm(other_id)["name"]
+            for other_id in adapter.algorithm_ids if other_id != algorithm_id
+        ]
+        _submit_turn(conversation, algorithm_id, algorithm, active, field_id, message, other_names)
+        st.rerun()
+
+    if suggestions:
+        _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggestions)
+        if not edit:
+            return
+
     with st.chat_message("assistant"):
         if field_id is None:
-            st.write(f"All applicable questions for {_identity(algorithm)} have been answered.")
+            if pending:
+                st.write("Review skipped questions to complete this algorithm's answers.")
+            else:
+                st.write(f"All applicable questions for {_identity(algorithm)} have been answered.")
             return
         definition = BY_ID[field_id]
         st.write(f"**{field_id}** · {definition['label']}")
@@ -139,20 +286,16 @@ def render_d23_chat():
     key = f"d23-answer-{algorithm_id}-{field_id}-{revision}"
     with st.chat_message("user"):
         value = _answer_input(definition, current, key)
-        if needs_details(field_id, value):
-            st.caption("An explanation is required for this answer.")
-        details = st.text_area("Explanation", value=existing.get("details", ""), key=f"{key}-details")
-        evidence = st.text_input(
-            "Document evidence reference",
-            value=existing.get("evidence", ""),
-            key=f"{key}-evidence",
-            help="Enter the supporting document ID, version, and page or section.",
+        details, evidence = _answer_metadata(
+            field_id, value, key, details=existing.get("details", ""), evidence=existing.get("evidence", ""),
         )
         if st.button("Confirm D2.3 answer", key=f"{key}-confirm"):
+            quote = algorithm["source_quotes"].get(field_id, "") if _same_value(value, current) else ""
             try:
-                adapter.save_answer(algorithm_id, field_id, value, details=details, evidence=evidence)
+                _save_answer(adapter, algorithm_id, field_id, value, details, evidence, conversation, quote)
             except ValueError as error:
                 st.error(str(error))
-            else:
-                state.d23_answer_revision += 1
-                st.rerun()
+        if field_id in pending and st.button("Skip this question", key=f"{key}-skip"):
+            conversation["skipped"].add(field_id)
+            state.d23_answer_revision += 1
+            st.rerun()

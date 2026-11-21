@@ -495,6 +495,7 @@ def reset_application():
         "d23_adapter",
         "d23_active_algorithm_id",
         "d23_answer_revision",
+        "d23_conversations",
         "d23-algorithm-picker",
     ]
 

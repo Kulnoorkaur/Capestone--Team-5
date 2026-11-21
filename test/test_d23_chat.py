@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,8 @@ from app.deliverable_2.questionnaires.algorithm_change_control import (
     ADAPTIVE,
     BY_ID,
     FRAMEWORKS,
+    LOCKED,
+    SITE,
     needs_details,
 )
 
@@ -23,8 +26,9 @@ class D23ChatTests(unittest.TestCase):
     def setUp(self):
         gemini = patch.object(chat_llm, "get_gemini_client", side_effect=AssertionError("Unexpected Gemini call"))
         self.gemini = gemini.start()
+        self.requests = []
         self.addCleanup(gemini.stop)
-        self.addCleanup(self.gemini.assert_not_called)
+        self.addCleanup(lambda: self.assertEqual(self.gemini.call_count, len(self.requests)))
         self.app = AppTest.from_file(str(CHAT_APP), default_timeout=30).run()
         self.assert_no_errors()
 
@@ -112,6 +116,35 @@ class D23ChatTests(unittest.TestCase):
                       if call.args and call.args[0] == "Export Confirmed Profile"]
         self.assertEqual(download["file_name"], "regulatory_d21_d22_profile.json")
         self.assertEqual(json.loads(download["data"]), expected)
+
+    def send_turn(self, message, candidates, *, clarification="", algorithm_override=None):
+        algorithm = self.app.session_state.d23_active_algorithm_id
+        calls_before = len(self.requests)
+
+        def generate(**kwargs):
+            prompt = kwargs["contents"]
+            payload = json.loads(prompt.strip().splitlines()[-1])
+            self.requests.append((prompt, payload))
+            return SimpleNamespace(text=json.dumps({
+                "algorithm_id": algorithm_override or payload["algorithm_id"],
+                "source_id": payload["source_id"],
+                "candidates": candidates,
+                "clarification": clarification,
+            }))
+
+        self.gemini.side_effect = None
+        self.gemini.return_value = SimpleNamespace(models=SimpleNamespace(generate_content=generate))
+        self.app.chat_input(key=f"d23-chat-input-{algorithm}").set_value(message).run()
+        self.assert_no_errors()
+        self.assertEqual(len(self.requests), calls_before + 1)
+        _, payload = self.requests[-1]
+        self.assertEqual(payload["algorithm_id"], algorithm)
+        self.assertEqual(payload["user_message"], message)
+        return f"d23-review-{algorithm}-{payload['source_id']}"
+
+    def review_action(self, prefix, field, action):
+        self.app.button(key=f"{prefix}-{field}-{action}").click().run()
+        self.assert_no_errors()
 
     def test_entry_identity_selection_and_legacy_profile_compatibility(self):
         self.finish_d22()
@@ -328,3 +361,207 @@ class D23ChatTests(unittest.TestCase):
         self.assertEqual(adapter.build_record(algorithm_id)["answers"]["ACC-001"]["evidence"], "")
         self.assertEqual(adapter.get_algorithm(algorithm_id)["source_quotes"]["ACC-001"],
                          "The model is called Adaptive model.")
+
+    def test_multi_field_turn_reuses_deferred_follow_up_without_another_call(self):
+        self.finish_d22()
+        algorithm_id = self.add_algorithm("Retina screening model", "1.0")
+        adapter = self.app.session_state.d23_adapter
+        locked = "We use a locked convolutional neural network."
+        plan = "We retrain it offline every six months using additional images to maintain performance."
+        prefix = self.send_turn(f"{locked} {plan}", {
+            "ACC-004": {"value": ["CNN"], "quote": locked},
+            "ACC-008": {"value": LOCKED, "quote": locked},
+            "ACC-013": {"value": "Yes", "quote": plan},
+            "ACC-016": {"value": plan, "quote": plan, "details": "to maintain performance"},
+        })
+        state = self.app.session_state.d23_conversations[algorithm_id]
+        self.assertEqual(state["candidates"]["ACC-016"]["algorithm_id"], algorithm_id)
+        self.assertEqual(state["candidates"]["ACC-016"]["field_id"], "ACC-016")
+        self.assertEqual(state["candidates"]["ACC-016"]["source_id"], "1")
+        self.assertNotIn(f"{prefix}-ACC-016-confirm", [button.key for button in self.app.button])
+        self.assertEqual(adapter.get_algorithm(algorithm_id)["answers"], {})
+        self.review_action(prefix, "ACC-008", "confirm")
+        self.review_action(prefix, "ACC-013", "confirm")
+        self.assertIn(f"{prefix}-ACC-016-confirm", [button.key for button in self.app.button])
+        self.assertNotIn("ACC-016", adapter.get_algorithm(algorithm_id)["answers"])
+        self.assertEqual(self.app.text_area(key=f"{prefix}-ACC-016-details").value, "to maintain performance")
+        self.assertEqual(self.app.text_input(key=f"{prefix}-ACC-016-evidence").value, "")
+
+        stale = self.app.button(key=f"{prefix}-ACC-016-confirm").id
+        self.revise(algorithm_id, "ACC-013")
+        self.set_answer("ACC-013", "No")
+        self.click("Confirm D2.3 answer")
+        self.send_stale_confirmation(stale)
+        self.assertNotIn("ACC-016", state["candidates"])
+        snapshot = adapter.get_algorithm(algorithm_id)
+        self.assertNotIn("ACC-016", snapshot["answers"])
+        self.assertEqual(snapshot["answers"]["ACC-008"]["value"], LOCKED)
+        self.assertEqual(snapshot["source_quotes"]["ACC-008"], locked)
+        self.assertEqual(snapshot["answers"]["ACC-008"]["evidence"], "")
+        self.assertEqual(len(self.requests), 1)
+
+    def test_adaptive_parent_is_reviewed_before_its_follow_ups(self):
+        self.finish_d22()
+        algorithm = self.add_algorithm("Adaptive screening model", "1.0")
+        adapter = self.app.session_state.d23_adapter
+        behavior = "The deployed algorithm adapts in the field through learning."
+        mechanism = "It learns from reviewed site images when drift triggers an update, and the model lead approves each change before activation."
+        safeguards = "Human approval and an audit log safeguard every update."
+        prefix = self.send_turn(f"{behavior} {mechanism} {safeguards}", {
+            "ACC-008": {"value": ADAPTIVE, "quote": behavior},
+            "ACC-010": {"value": mechanism, "quote": mechanism},
+            "ACC-011": {"value": ["Human approval", "Audit log"], "quote": safeguards},
+        })
+
+        def offered():
+            return [button.key for button in self.app.button if button.label == "Confirm suggestion"]
+
+        self.assertEqual(offered(), [f"{prefix}-ACC-008-confirm"])
+        self.assertEqual(adapter.get_algorithm(algorithm)["answers"], {})
+        self.review_action(prefix, "ACC-008", "confirm")
+        self.assertTrue({"ACC-010", "ACC-011"} <= set(adapter.active_field_ids(algorithm)))
+        self.assertEqual(offered(), [f"{prefix}-ACC-010-confirm", f"{prefix}-ACC-011-confirm"])
+        self.assertEqual(set(adapter.get_algorithm(algorithm)["answers"]), {"ACC-008"})
+        self.review_action(prefix, "ACC-010", "confirm")
+        self.assertNotIn("ACC-011", adapter.get_algorithm(algorithm)["answers"])
+        self.review_action(prefix, "ACC-011", "confirm")
+        snapshot = adapter.get_algorithm(algorithm)
+        self.assertEqual(set(snapshot["answers"]), {"ACC-008", "ACC-010", "ACC-011"})
+        self.assertEqual(snapshot["source_quotes"], {
+            "ACC-008": behavior, "ACC-010": mechanism, "ACC-011": safeguards,
+        })
+        self.assertEqual(len(self.requests), 1)
+
+    def test_nested_follow_ups_require_both_ancestors_and_keep_partial_statuses(self):
+        self.finish_d22()
+        algorithm = self.add_algorithm("Planned-update model", "1.0")
+        adapter = self.app.session_state.d23_adapter
+        planned = "We plan to retrain next year."
+        documented = "Change plan CP-01 documents the planned changes and their verification."
+        statuses = "The plan is under FDA review, planned for Health Canada submission, and not submitted under EU MDR or EU AI Act."
+        expected = {
+            "FDA": "Under review", "Health Canada": "Planned for submission",
+            "EU MDR": "Not submitted", "EU AI Act": "Not submitted",
+        }
+        prefix = self.send_turn(f"{planned} {documented} {statuses}", {
+            "ACC-013": {"value": "Yes", "quote": planned},
+            "ACC-019": {"value": "Yes", "quote": documented, "details": documented},
+            "ACC-020": {"value": expected, "quote": statuses},
+        })
+
+        def offered():
+            return [button.key for button in self.app.button if button.label == "Confirm suggestion"]
+
+        self.assertEqual(offered(), [f"{prefix}-ACC-013-confirm"])
+        self.assertEqual(adapter.get_algorithm(algorithm)["answers"], {})
+        self.review_action(prefix, "ACC-013", "confirm")
+        self.assertEqual(offered(), [f"{prefix}-ACC-019-confirm"])
+        self.assertNotIn("ACC-020", adapter.active_field_ids(algorithm))
+        self.review_action(prefix, "ACC-019", "confirm")
+        self.assertIn("ACC-020", adapter.active_field_ids(algorithm))
+        self.assertEqual(offered(), [f"{prefix}-ACC-020-confirm"])
+        self.assertNotIn("ACC-020", adapter.get_algorithm(algorithm)["answers"])
+        self.review_action(prefix, "ACC-020", "confirm")
+        self.assertEqual(adapter.get_algorithm(algorithm)["answers"]["ACC-020"]["value"], expected)
+        self.assertEqual(len(self.requests), 1)
+
+        corrected = "Only the FDA status is known: under review."
+        prefix = self.send_turn(f"Correction: {corrected}", {
+            "ACC-020": {
+                "value": {"FDA": "Under review", "EU MDR": "Not submitted"},
+                "quote": corrected,
+            },
+        })
+        for framework in FRAMEWORKS:
+            widget = self.app.selectbox(key=f"{prefix}-ACC-020-{framework}")
+            self.assertEqual(widget.value, "Under review" if framework == "FDA" else None)
+        self.assertEqual(adapter.get_algorithm(algorithm)["answers"]["ACC-020"]["value"], expected)
+        self.review_action(prefix, "ACC-020", "confirm")
+        self.assertEqual(adapter.get_algorithm(algorithm)["answers"]["ACC-020"]["value"], {
+            framework: "Under review" if framework == "FDA" else None for framework in FRAMEWORKS
+        })
+        self.assertEqual(len(self.requests), 2)
+
+    def test_rejection_explicit_correction_and_review_are_algorithm_scoped(self):
+        self.finish_d22()
+        first = self.add_algorithm("Screening model", "1.0")
+        adapter = self.app.session_state.d23_adapter
+        claim = "The architecture is CNN."
+        candidate = {"ACC-004": {"value": ["CNN"], "quote": claim}}
+        prefix = self.send_turn(claim, candidate)
+        self.review_action(prefix, "ACC-004", "reject")
+        prefix = self.send_turn(claim, candidate)
+        self.assertNotIn(f"{prefix}-ACC-004-confirm", [button.key for button in self.app.button])
+        prefix = self.send_turn(f"Correction: {claim}", candidate)
+        self.review_action(prefix, "ACC-004", "confirm")
+        self.assertEqual(adapter.get_algorithm(first)["answers"]["ACC-004"]["value"], ["CNN"])
+
+        changed = "The architecture is a Vision transformer."
+        new_candidate = {"ACC-004": {"value": ["Vision transformer"], "quote": changed}}
+        prefix = self.send_turn(f"Correction: {changed}", new_candidate)
+        confirm = self.app.button(key=f"{prefix}-ACC-004-confirm").id
+        second = self.add_algorithm("Triage model", "2.0")
+        self.send_stale_confirmation(confirm)
+        self.assertEqual(adapter.get_algorithm(second)["answers"], {})
+        self.assertEqual(adapter.get_algorithm(first)["answers"]["ACC-004"]["value"], ["CNN"])
+        bad_prefix = self.send_turn(changed, new_candidate, algorithm_override=first)
+        self.assertNotIn(f"{bad_prefix}-ACC-004-confirm", [button.key for button in self.app.button])
+        other_claim = "The Screening model uses CNN."
+        bad_prefix = self.send_turn(other_claim, {"ACC-004": {"value": ["CNN"], "quote": other_claim}})
+        self.assertNotIn(f"{bad_prefix}-ACC-004-confirm", [button.key for button in self.app.button])
+        self.app.selectbox(key="d23-algorithm-picker").select(first).run()
+        self.assert_no_errors()
+        self.review_action(prefix, "ACC-004", "confirm")
+        self.assertEqual(adapter.get_algorithm(first)["answers"]["ACC-004"]["value"], ["Vision transformer"])
+        self.assertEqual(adapter.get_algorithm(second)["answers"], {})
+        self.assertEqual(len(self.requests), 6)
+
+    def test_invalid_and_unsupported_candidates_are_not_offered(self):
+        self.finish_d22()
+        algorithm = self.add_algorithm("Demo algorithm", "1.0")
+        adapter = self.app.session_state.d23_adapter
+        offline = "We retrain offline every six months."
+        thresholds = "Thresholds can be configured by individual sites."
+        planned = "We plan to submit the change plan to FDA."
+        verification = "We plan to run regression tests before release."
+        valid = "It uses supervised learning."
+        prefix = self.send_turn(f"{offline} {thresholds} {planned} {verification} {valid}", {
+            "ACC-008": {"value": ADAPTIVE, "quote": offline},
+            "ACC-009": {"value": ["Model weights"], "quote": thresholds},
+            "ACC-020": {"value": {"FDA": "Authorized or accepted"}, "quote": planned},
+            "ACC-023": {"value": "Regression testing was completed.", "quote": verification},
+            "ACC-007": {"value": "Configurable by site or user", "quote": thresholds, "details": "inferred detail"},
+            "ACC-003": {"value": ["Supervised"], "quote": valid, "evidence": "Invented document"},
+            "ACC-004": {"value": ["Invalid option"], "quote": valid},
+            "ACC-006": {"value": "Yes", "quote": "Not actually present"},
+            "ACC-999": {"value": "Yes", "quote": valid},
+        })
+        candidates = self.app.session_state.d23_conversations[algorithm]["candidates"]
+        self.assertEqual(set(candidates), {"ACC-003", "ACC-007"})
+        self.assertEqual(candidates["ACC-007"]["details"], "")
+        self.assertNotIn("evidence", candidates["ACC-003"])
+        self.assertEqual(adapter.get_algorithm(algorithm)["answers"], {})
+        prompt, _ = self.requests[-1]
+        self.assertIn("A plan to verify does not establish", prompt)
+        self.assertIn("General quality checks do not establish a documented", prompt)
+        self.app.multiselect(key=f"{prefix}-ACC-003").set_value(["Unsupervised"])
+        self.app.text_input(key=f"{prefix}-ACC-003-evidence").set_value("Training report V1, §3")
+        self.review_action(prefix, "ACC-003", "confirm")
+        record = adapter.get_algorithm(algorithm)
+        self.assertEqual(record["answers"]["ACC-003"], {
+            "value": ["Unsupervised"], "details": "", "evidence": "Training report V1, §3",
+        })
+        self.assertNotIn("ACC-003", record["source_quotes"])
+
+    def test_clarification_and_skip_leave_answers_unconfirmed(self):
+        self.finish_d22()
+        algorithm_id = self.add_algorithm("Demo algorithm", "1.0")
+        adapter = self.app.session_state.d23_adapter
+        self.send_turn("What counts as a model release?", {}, clarification="Use the released model version.")
+        self.assertTrue(any("Use the released model version." in item.value for item in self.app.markdown))
+        claim = "The model uses supervised learning."
+        prefix = self.send_turn(claim, {"ACC-003": {"value": ["Supervised"], "quote": claim}})
+        self.review_action(prefix, "ACC-003", "skip")
+        self.assertEqual(adapter.get_algorithm(algorithm_id)["answers"], {})
+        self.assertIn("ACC-003", self.app.session_state.d23_conversations[algorithm_id]["skipped"])
+        self.assertEqual(len(self.requests), 2)

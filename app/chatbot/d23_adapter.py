@@ -73,12 +73,25 @@ class D23AnswerAdapter:
         A partial framework map is allowed and remains an incomplete answer.
         """
         algorithm = self._algorithms[algorithm_id]
+        answers = self._checked_answers(algorithm, field_id, value, details, evidence)
+        if not isinstance(source_quote, str):
+            raise ValueError(f"{field_id}: source quote must be text.")
+        quotes = {key: quote for key, quote in algorithm.source_quotes.items() if key != field_id}
+        if source_quote:
+            quotes[field_id] = source_quote
+        self._store_active_answers(algorithm, answers, quotes)
+
+    def check_answer(self, algorithm_id: str, field_id: str, value: AnswerValue, *, details: str = "") -> None:
+        """Check a candidate against current activation and owner validation."""
+        self._checked_answers(self._algorithms[algorithm_id], field_id, value, details, "")
+
+    def _checked_answers(self, algorithm, field_id, value, details, evidence):
         definition = FIELDS_BY_ID.get(field_id)
         if definition is None:
             raise ValueError(f"Unknown D2.3 field: {field_id}.")
         if not is_active(field_id, algorithm.answers):
             raise ValueError(f"{field_id}: This conditional question is inactive.")
-        for label, text in (("details", details), ("evidence", evidence), ("source quote", source_quote)):
+        for label, text in (("details", details), ("evidence", evidence)):
             if not isinstance(text, str):
                 raise ValueError(f"{field_id}: {label} must be text.")
         self._validate_value(definition, value)
@@ -99,10 +112,7 @@ class D23AnswerAdapter:
                 continue
             raise ValueError(f"{field_id}: {problem}.")
 
-        quotes = {key: quote for key, quote in algorithm.source_quotes.items() if key != field_id}
-        if source_quote:
-            quotes[field_id] = source_quote
-        self._store_active_answers(algorithm, answers, quotes)
+        return answers
 
     def remove_answer(self, algorithm_id: str, field_id: str) -> None:
         """Clear a confirmed answer and any descendants it deactivates."""
