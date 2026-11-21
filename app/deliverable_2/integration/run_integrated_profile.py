@@ -21,15 +21,19 @@ from openpyxl import load_workbook
 
 # Use the actual team-owned questionnaires; do not duplicate or overwrite them.
 ROOT = Path(__file__).resolve().parents[3]
-QUESTIONNAIRES = ROOT / "app" / "deliverable_2" / "questionnaires"
-if str(QUESTIONNAIRES) not in sys.path:
-    sys.path.insert(0, str(QUESTIONNAIRES))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from product_profile import render_product_profile, FIELD_LABELS as PIP_LABELS
-from ai_function import render_ai_function, FIELD_LABELS as AIF_LABELS
-from Dataset_and_evidence import render_dataset_evidence
-from risk_documentation import render_risk_documentation, FIELD_LABELS as RISK_LABELS
-from algorithm_change_control import (
+from app.chatbot.profile_io import ProfileImportError, load_confirmed_profile
+from app.chatbot.questionnaire_bridge import QUESTIONNAIRE_FIELDS
+from app.deliverable_2.questionnaires.product_profile import render_product_profile, FIELD_LABELS as PIP_LABELS
+from app.deliverable_2.questionnaires.ai_function import render_ai_function, FIELD_LABELS as AIF_LABELS
+from app.deliverable_2.questionnaires.Dataset_and_evidence import render_dataset_evidence
+from app.deliverable_2.questionnaires.risk_documentation import render_risk_documentation, FIELD_LABELS as RISK_LABELS
+from app.deliverable_2.validation.run_ai_function import validate_ai_function
+from app.deliverable_3.product_validation import validate_profile
+
+from app.deliverable_2.questionnaires.algorithm_change_control import (
     FIELDS as ACC_FIELDS, GROUPS as ACC_GROUPS, FRAMEWORKS as ACC_FRAMEWORKS,
     is_active as acc_is_active, needs_details as acc_needs_details,
     build_record as acc_build_record,
@@ -496,6 +500,71 @@ def render_algorithm_answers():
     return models
 
 
+def select_answer_source(use_import):
+    st.session_state["d26-use-chatbot-profile"] = use_import
+    for key in ("d26-profile", "d26-results", "d26-retained-inputs-ack"):
+        st.session_state.pop(key, None)
+
+
+def render_import_preview(profile):
+    sections = (
+        ("D2.1 Product", "D2.1", profile["product"], validate_profile),
+        ("D2.2 AI function", "D2.2", profile["ai_function"], validate_ai_function),
+    )
+    st.success("Valid Chat Buddy export. Review the answers before accepting it.")
+    for title, questionnaire, answers, validate in sections:
+        with st.expander(title, expanded=True):
+            primary = QUESTIONNAIRE_FIELDS[questionnaire]
+            answered = sum(field_id in answers for field_id in primary)
+            st.caption(
+                f"{len(answers)} confirmed answers, including {answered}/{len(primary)} primary fields."
+            )
+            st.json(answers)
+            issues = validate(answers)
+            if answered < len(primary) or any(
+                issue["type"] in ("missing", "conditional") for issue in issues
+            ):
+                st.warning("This questionnaire is incomplete. You can still use the profile.")
+            if issues:
+                st.dataframe(issues, hide_index=True, use_container_width=True)
+            else:
+                st.caption("No findings from the questionnaire validator.")
+
+
+def render_chatbot_import():
+    st.subheader("Chat Buddy profile import")
+    uploaded = st.file_uploader("Upload a Chat Buddy confirmed profile (JSON)", type=["json"])
+    if uploaded is not None:
+        try:
+            preview = load_confirmed_profile(uploaded.getvalue())
+        except ProfileImportError as error:
+            st.error(str(error))
+        else:
+            render_import_preview(preview)
+            st.info(
+                "Existing D2.3–D2.5 and integration inputs will be retained. "
+                "They must describe the same product and version as this profile."
+            )
+            if st.button("Use this profile"):
+                st.session_state["d26-chatbot-profile"] = preview
+                select_answer_source(True)
+
+    accepted = st.session_state.get("d26-chatbot-profile")
+    if st.session_state.get("d26-use-chatbot-profile", False):
+        if st.button("Use manual answers"):
+            select_answer_source(False)
+    elif accepted is not None and st.button("Use accepted Chat Buddy profile"):
+        select_answer_source(True)
+
+    if st.session_state.get("d26-use-chatbot-profile", False):
+        st.caption("Evaluation uses the accepted Chat Buddy profile for D2.1 and D2.2. Manual drafts are kept.")
+        product_identity = accepted["product"].get("PIP-001", "Not provided")
+        st.text(f"Accepted product and version: {product_identity}")
+        return accepted
+    st.caption("Evaluation uses manual D2.1 and D2.2 answers.")
+    return None
+
+
 st.set_page_config(page_title="Team 5 | Integrated Imaging-AI Profile", layout="wide")
 st.caption("ENGG 501 · TEAM 5 · DELIVERABLE 2.6 · INTEGRATION LEAD: CHANDRIMA")
 st.title("Imaging-AI Product Profile V1 — Integrated")
@@ -507,6 +576,8 @@ if matrix_warnings:
 else:
     st.caption(f"D1.6 matrix loaded: {len(requirements)} unique requirement records. "
                "Research status remains draft until reviewer sign-off.")
+
+imported_profile = render_chatbot_import()
 
 pages = st.tabs(["D2.1 Product", "D2.2 AI function", "D2.3 Algorithm/change",
                  "D2.4 Datasets/evidence", "D2.5 Risk/cyber/docs", "D2.6 Scope inputs",
@@ -543,9 +614,21 @@ with pages[6]:
     st.header("D2.6 — Four framework-specific decision trees")
     st.write("Run only after answering the relevant fields. Unknown/contradictory inputs "
              "are routed to manual regulatory review; no automatic legal classification is issued.")
-    if st.button("Evaluate integrated profile", type="primary"):
-        profile = {"schema_version": "D2.6-V1", "product": product,
-                   "ai_function": ai_function, "algorithms": algorithms,
+    can_evaluate = True
+    if imported_profile is not None:
+        st.warning(
+            "D2.3–D2.5 and integration inputs are retained from this session. "
+            "Check that they apply to the imported product and version before evaluating."
+        )
+        can_evaluate = st.checkbox(
+            "I confirm the retained inputs describe the same product and version as the imported profile.",
+            key="d26-retained-inputs-ack",
+        )
+    if st.button("Evaluate integrated profile", type="primary", disabled=not can_evaluate) and can_evaluate:
+        evaluation_product = imported_profile["product"] if imported_profile is not None else product
+        evaluation_ai_function = imported_profile["ai_function"] if imported_profile is not None else ai_function
+        profile = {"schema_version": "D2.6-V1", "product": evaluation_product,
+                   "ai_function": evaluation_ai_function, "algorithms": algorithms,
                    "dataset_evidence": datasets, "risk_documentation": risk,
                    "integration": integration}
         st.session_state["d26-profile"] = profile
