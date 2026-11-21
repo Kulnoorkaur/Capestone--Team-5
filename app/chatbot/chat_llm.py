@@ -10,6 +10,7 @@ Functions:
 
 import json
 import os
+import re
 import time
 
 from google import genai
@@ -408,18 +409,125 @@ Do not include additional text.
 # EXTRACT STRUCTURED QUESTIONNAIRE FIELDS
 # ============================================================
 
+_CLAIM_BOUNDARY = re.compile(r"[.!?](?=\s|$)|[;\n]")
+_NEGATIVE_CLAIM = re.compile(
+    r"(?P<subject>.+?) (?P<aux>does|do|did|can|will) not "
+    r"(?P<verb>[a-z]+) (?P<detail>.+)"
+)
+_EXPLICIT_CORRECTION = re.compile(
+    r"^\s*(?:correction\s*:|i (?:was wrong|misspoke)\b|"
+    r"my (?:earlier|previous) statement was (?:wrong|incorrect)\b)",
+    re.IGNORECASE,
+)
+
+
+def _claim_text(text):
+    text = " ".join(text.casefold().split()).strip(" .!?")
+    text = text.removeprefix("correction:").lstrip()
+    return re.sub(
+        r"\b(does|do|did|ca|wo)n['’]t\b|\bcannot\b",
+        lambda match: {"ca": "can", "wo": "will"}.get(match[1], match[1] or "can") + " not",
+        text,
+    )
+
+
+def _affirmative_forms(aux, verb):
+    if aux in {"can", "will"}:
+        return (f"{aux} {verb}",)
+    if aux == "did":
+        return (f"did {verb}",)
+    if verb.endswith(("s", "sh", "ch", "x", "z", "o")):
+        inflected = verb + "es"
+    elif verb.endswith("y") and len(verb) > 1 and verb[-2] not in "aeiou":
+        inflected = verb[:-1] + "ies"
+    else:
+        inflected = verb + "s"
+    return (verb, inflected, f"{aux} {verb}")
+
+
+def _mentions_claim_detail(quote, detail):
+    # Word boundaries avoid matching a fragment inside a different capability.
+    return bool(
+        re.search(rf"(?<!\w){re.escape(detail)}(?!\w)", quote)
+        or re.search(rf"(?<!\w){re.escape(quote)}(?!\w)", detail)
+    )
+
+
+def _has_direct_conflict(source_id, quote, value, source_turns, eligible_ids):
+    """Withhold candidates anchored to a near-verbatim opposing claim."""
+    if len(eligible_ids) < 2:
+        return False
+
+    messages = {turn_id: turn["message"] for turn_id, turn in source_turns.items()
+                if turn_id in eligible_ids}
+    claims = {turn_id: [_claim_text(sentence) for sentence in _CLAIM_BOUNDARY.split(message)]
+              for turn_id, message in messages.items()}
+    quoted = [_claim_text(sentence) for sentence in _CLAIM_BOUNDARY.split(quote)]
+
+    for other_id, other_claims in claims.items():
+        if other_id == source_id:
+            continue
+        for cited_claim in claims[source_id]:
+            cited_fragments = [fragment for fragment in quoted if fragment and fragment in cited_claim]
+            if not cited_fragments:
+                continue
+            for other_claim in other_claims:
+                for negative, affirmative in ((cited_claim, other_claim), (other_claim, cited_claim)):
+                    match = _NEGATIVE_CLAIM.fullmatch(negative)
+                    if not match:
+                        continue
+                    subject, aux, verb, detail = match.groups()
+                    for form in _affirmative_forms(aux, verb):
+                        # In "X generates labels and does not generate scores",
+                        # the second clause inherits X as its subject.
+                        claim_subject = subject
+                        if subject.endswith((" and", " but")) and f" {form} " in subject:
+                            claim_subject = subject.split(f" {form} ", 1)[0]
+                        prefix = f"{claim_subject} {form} "
+                        if not affirmative.startswith(prefix):
+                            continue
+                        options = re.split(r"\s*,\s*|\s+and\s+", affirmative[len(prefix):])
+                        if detail not in [option.removeprefix("and ") for option in options]:
+                            continue
+                        if not any(_mentions_claim_detail(fragment, detail) for fragment in cited_fragments):
+                            continue
+                        later_correction = (
+                            source_id.isdecimal() and other_id.isdecimal()
+                            and int(source_id) > int(other_id)
+                            and _EXPLICIT_CORRECTION.match(messages[source_id])
+                        )
+                        retains_denied_option = (
+                            cited_claim == negative
+                            and isinstance(value, list)
+                            and any(
+                                isinstance(option, str) and option.strip()
+                                and _mentions_claim_detail(_claim_text(option), detail)
+                                for option in value
+                            )
+                        )
+                        if not later_correction or retains_denied_option:
+                            return True
+    return False
+
+
 def extract_questionnaire_fields(
     user_message,
     confirmed_answers=None,
     target_field_id=None,
     target_question=None,
     questionnaire="D2.1",
+    *,
+    source_turns=None,
+    eligible_fields=None,
+    conditional_context=False,
 ):
     """
     Extract candidate D2.1 or D2.2 questionnaire field values
     from a natural-language user message.
 
     Returns validated suggestions, NOT confirmed answers.
+    In carryover mode, eligible_fields maps field IDs to allowed turn IDs,
+    and each returned candidate includes its source ID and supporting quote.
 
     Example:
         {
@@ -434,7 +542,8 @@ def extract_questionnaire_fields(
         QuestionnaireBridge,
     )
 
-    if not isinstance(user_message, str) or not user_message.strip():
+    carryover = source_turns is not None
+    if not carryover and (not isinstance(user_message, str) or not user_message.strip()):
         raise ValueError("User message cannot be empty.")
 
     confirmed_answers = confirmed_answers or {}
@@ -445,7 +554,6 @@ def extract_questionnaire_fields(
     bridge = QuestionnaireBridge()
 
     # Only expose fields belonging to the active questionnaire.
-    primary_ids = bridge.get_missing_fields(questionnaire)
     # Include already-confirmed primary fields in the definitions too,
     # so the model can interpret context while never overwriting them.
     prefix = "PIP-" if questionnaire == "D2.1" else "AIF-"
@@ -463,6 +571,10 @@ def extract_questionnaire_fields(
                 active_conditionals.append(child_id)
 
     allowed_fields = set(primary_ids) | set(active_conditionals)
+    if carryover:
+        allowed_fields = (allowed_fields & set(eligible_fields)) - confirmed_answers.keys()
+        if not source_turns or not allowed_fields:
+            return {}
     # Never extract an inactive conditional field, even if the model suggests it.
     field_definitions = {}
 
@@ -473,9 +585,47 @@ def extract_questionnaire_fields(
             "type": bridge.get_field_type(field_id),
             "options": bridge.get_field_options(field_id),
         }
+        if carryover:
+            field_definitions[field_id]["source_ids"] = eligible_fields[field_id]
+            if conditional_context and field_id in CONDITIONAL_FIELDS:
+                parent_id, _ = CONDITIONAL_FIELDS[field_id]
+                parent_label = bridge.get_field_label(parent_id)
+                field_definitions[field_id].update({
+                    "question": generate_questionnaire_question(
+                        field_id, label, bridge.get_field_type(field_id),
+                        bridge.get_field_options(field_id),
+                    ),
+                    "confirmed_parent": {
+                        "field_id": parent_id,
+                        "label": parent_label,
+                        "value": confirmed_answers[parent_id],
+                    },
+                    "evidence_rule": (
+                        "Answer the follow-up itself from the original user message. "
+                        "The confirmed parent selection only explains why it applies. "
+                        "Quote the words that state the detail and omit this field "
+                        "if the message only states the parent selection."
+                    ),
+                })
+                if field_id.endswith("-OTHER"):
+                    field_definitions[field_id]["detail_to_extract"] = (
+                        f"What specific {parent_label.lower()} does the user say the product uses? "
+                        f"A statement such as 'The {parent_label.lower()} is [name]' "
+                        "directly answers this follow-up. Copy the named detail."
+                    )
 
     client = get_gemini_client()
 
+    source_text = json.dumps(source_turns, ensure_ascii=False) if carryover else user_message
+    output_instructions = (
+        'For each field return an object with "value", "source_id" (the exact turn ID), '
+        'and "quote" (an exact excerpt from that turn\'s message supporting the entire value). '
+        'Omit fields without a supporting excerpt. Read each short reply only in the context '
+        'of its original question. Questionnaire wording is context, never evidence. '
+        'Use only the source IDs listed for the field. Larger turn IDs are later messages.'
+        if carryover else
+        'Return field IDs as keys and the proposed string or list values directly.'
+    )
     extraction_prompt = f"""
 You are extracting structured information about an
 imaging-informed medical AI product.
@@ -484,7 +634,7 @@ The user is completing {questionnaire}:
 {"Product and Intended-Use Profile" if questionnaire == "D2.1" else "AI Function and Clinical Workflow"}.
 
 USER MESSAGE:
-{user_message}
+{source_text}
 
 CURRENT QUESTION BEING ANSWERED:
 {target_question or "Initial product description (no targeted question yet)"}
@@ -493,7 +643,7 @@ TARGET FIELD ID:
 {target_field_id or "None"}
 
 PREVIOUSLY CONFIRMED QUESTIONNAIRE ANSWERS:
-{json.dumps(confirmed_answers, indent=2, ensure_ascii=False)}
+{json.dumps({} if carryover else confirmed_answers, indent=2, ensure_ascii=False)}
 
 QUESTIONNAIRE FIELD DEFINITIONS:
 {json.dumps(field_definitions, indent=2, ensure_ascii=False)}
@@ -542,27 +692,103 @@ IMPORTANT RULES:
     interpreted in light of the current question, but only
     when their meaning is unambiguous.
 
-Example output (use only fields available in the definitions):
+13. Use current product facts. Do not present plans, possible future
+    features, hypotheticals, or examples as current capabilities.
+    Preserve explicit negatives where relevant. Never include an
+    explicitly unsupported feature in a positive list.
 
-{{"{ "PIP-006" if questionnaire == "D2.1" else "AIF-001" }": {json.dumps("CT" if questionnaire == "D2.1" else ["Medical images"])}}}
+14. If evidence conflicts, omit the field unless the user clearly corrects
+    the earlier statement. Use the correction as evidence in that case.
+
+15. Distinguish automatically running technical tasks (AIF-015) from
+    initiating a clinical or workflow action without human approval
+    (AIF-019). Technical automation alone does not establish that the
+    product initiates such an action.
+
+16. Check each candidate against the information its field actually asks for.
+    The user's words must establish the proposed answer and each of its parts.
+    A related topic, a plausible workflow, or a statement that rules out one
+    possibility is insufficient. For carryover, the quoted words themselves
+    must establish the answer. If the evidence is incomplete, omit the field.
+
+17. AIF-011 asks who receives the AI output and who is responsible for the
+    clinical decision. Include it only when the user identifies both roles
+    explicitly. The same person or role may do both. Being a product user or
+    uploading an image does not establish who receives the output. Statements
+    about software limits or lack of autonomy do not identify the humans
+    responsible or any other operational roles. For example, "The software
+    does not independently initiate referrals" may support AIF-019 but does
+    not answer AIF-011. When both roles are stated, include AIF-011 and use
+    the user's wording that names the recipient and the decision-maker.
+
+18. Check every eligible field independently before returning the JSON.
+    A source sentence may directly support more than one field. For example,
+    a stated algorithm or method for analyzing inputs supports AIF-004 even
+    if the same sentence also describes the clinical finding or output.
+
+{output_instructions}
 
 Return ONLY valid JSON.
 """
 
+    targeted_followups = carryover and conditional_context and all(
+        field_id in CONDITIONAL_FIELDS for field_id in allowed_fields
+    )
+    if targeted_followups:
+        extraction_prompt = f"""
+Find answers to the listed follow-up questions in the original user messages.
+Each follow-up is already active. Read its exact question and confirmed parent
+to understand which detail to look for. Check each listed field separately.
+
+USER MESSAGE:
+{source_text}
+
+CURRENT QUESTION BEING ANSWERED:
+The follow-up question for each field is listed below.
+
+QUESTIONNAIRE FIELD DEFINITIONS:
+{json.dumps(field_definitions, indent=2, ensure_ascii=False)}
+
+TASK:
+
+If a permitted source message explicitly names or describes the requested
+detail, propose that detail, even if it appears elsewhere in a long reply.
+The parent selection is context. Do not use it as evidence or propose a value
+for the parent. Omit a follow-up when the source does not give its detail.
+For an "Other" follow-up, find the specific name or description that belongs
+in the text field. The user does not need to say "Other" or explain why the
+standard choices do not apply. For example, if the follow-up asks which
+imaging modality, return the modality explicitly named in the source, even
+if the same description already supported the parent selection.
+Do not treat plans, hypotheticals, or unsupported capabilities as current.
+If source statements conflict without a clear correction, omit the field.
+
+{output_instructions}
+Return only a JSON object mapping follow-up field IDs to candidate objects.
+Each candidate must contain "value", "source_id", and "quote". Use an exact
+verbatim quote from the message that directly states the proposed detail.
+Return {{}} if no follow-up detail is supported.
+"""
+
     response = generate_content_with_retry(
-    client,
+        client,
         model=MODEL_NAME,
         contents=extraction_prompt,
         config=types.GenerateContentConfig(
             system_instruction=(
-                "Extract explicitly supported D2.1 or D2.2 product facts into a JSON "
-                "object mapping field IDs to candidate values. Prioritize "
-                "the currently asked field when supported. Never invent "
-                "facts or make regulatory determinations."
+                "Answer the listed active follow-up questions using exact evidence from the source."
+                if targeted_followups
+                else (
+                    "Extract explicitly supported D2.1 or D2.2 product facts into a JSON "
+                    "object mapping field IDs to candidate values. Prioritize "
+                    "the currently asked field when supported. Never invent "
+                    "facts or make regulatory determinations."
+                )
             ),
             response_mime_type="application/json",
             temperature=0.1,
         ),
+        max_attempts=1 if carryover else 3,
     )
 
     if not response.text:
@@ -594,13 +820,34 @@ Return ONLY valid JSON.
         if field_id in confirmed_answers:
             continue
 
+        if carryover:
+            if not isinstance(value, dict):
+                continue
+            source_id, quote = value.get("source_id"), value.get("quote")
+            if not isinstance(source_id, str) or not isinstance(quote, str):
+                continue
+            source = source_turns.get(source_id)
+            if (
+                not source
+                or source_id not in eligible_fields[field_id]
+                or not quote.strip()
+                or quote not in source["message"]
+            ):
+                continue
+            value = value.get("value")
+            if _has_direct_conflict(source_id, quote, value, source_turns, eligible_fields[field_id]):
+                continue
+
         valid, error = bridge.validate_answer(
             field_id,
             value,
         )
 
         if valid:
-            validated_suggestions[field_id] = value
+            validated_suggestions[field_id] = (
+                {"value": value, "source_id": source_id, "quote": quote}
+                if carryover else value
+            )
 
     return validated_suggestions
 

@@ -49,6 +49,18 @@ WELCOME = (
 # SESSION STATE
 # ============================================================
 
+def new_carryover_state():
+    return {
+        "turns": {},
+        "evidence": {},
+        "confirmed_sources": set(),
+        "rejected": {},
+        "queued": {},
+        "attempted": set(),
+        "handoff_done": False,
+    }
+
+
 def initialize_session():
 
     defaults = {
@@ -60,6 +72,7 @@ def initialize_session():
             }
         ],
         "field_suggestions": dict,
+        "carryover": new_carryover_state,
         "asked_field": lambda: None,
         "asked_question": lambda: None,
         "retryable_turn": lambda: None,
@@ -234,6 +247,130 @@ def schedule_next_question():
     st.session_state.needs_next_question = True
 
 
+def evidence_key(text):
+    return " ".join(text.casefold().split())
+
+
+def was_rejected(field_id, message, quote=None):
+    source = evidence_key(message)
+    excerpt = f" {evidence_key(quote)} " if quote else None
+    return any(
+        source == rejected_source or (excerpt is not None and excerpt in f" {rejected_quote} ")
+        for rejected_source, rejected_quote in st.session_state.carryover["rejected"].get(field_id, ())
+    )
+
+
+def queue_activated_followups(field_id, value, active_before):
+    state = st.session_state.carryover
+    evidence = state["evidence"].pop(field_id, None)
+    if not evidence or evidence["value"] != value:
+        return
+    source_id = evidence["source_id"]
+    state["confirmed_sources"].add(source_id)
+    questionnaire = questionnaire_for_field(field_id)
+    source_text = evidence_key(state["turns"][source_id]["message"]).rstrip(".!?")
+    selected_option = value[0] if isinstance(value, list) and len(value) == 1 else value
+    if isinstance(selected_option, str) and source_text == evidence_key(selected_option):
+        return
+    for child_id in bridge.get_active_conditional_fields(questionnaire):
+        if child_id not in active_before and CONDITIONAL_FIELDS[child_id][0] == field_id:
+            state["queued"][child_id] = (source_id, value)
+
+
+def open_carryover_review(questionnaire, field_sources, *, handoff=False):
+    state = st.session_state.carryover
+    source_ids = dict.fromkeys(
+        source_id for sources in field_sources.values() for source_id in sources
+    )
+    sources = {}
+    seen = set()
+    for source_id in source_ids:
+        turn = state["turns"][source_id]
+        excerpt = turn["message"][:1800]
+        key = (evidence_key(excerpt), turn["question"])
+        if not key[0] or key in seen:
+            continue
+        seen.add(key)
+        sources[source_id] = {
+            "message": excerpt,
+            "original_question": (turn["question"] or "")[:600],
+        }
+        if len(sources) == 6:
+            break
+
+    eligible = {
+        field: [source_id for source_id in ids if source_id in sources]
+        for field, ids in field_sources.items()
+        if sources.keys() & set(ids)
+    }
+    if not eligible:
+        return False
+
+    try:
+        candidates = extract_questionnaire_fields(
+            user_message=None,
+            confirmed_answers=bridge.get_product_profile(),
+            questionnaire=questionnaire,
+            source_turns=sources,
+            eligible_fields=eligible,
+            conditional_context=not handoff,
+        )
+    except Exception as error:
+        print(f"Chat Buddy carryover error: {error}")
+        return False
+
+    for field_id, candidate in candidates.items():
+        if (
+            field_id in pending_fields(questionnaire)
+            and candidate["source_id"] in field_sources[field_id]
+            and not was_rejected(
+                field_id, state["turns"][candidate["source_id"]]["message"], candidate["quote"]
+            )
+        ):
+            st.session_state.field_suggestions[field_id] = candidate["value"]
+            state["evidence"][field_id] = {**candidate, "carried": True}
+
+    if not st.session_state.field_suggestions:
+        return False
+
+    st.session_state.review_batch_version += 1
+    st.session_state.active_questionnaire = questionnaire
+    description = "for D2.2" if handoff else "for the newly applicable follow-up"
+    add_message("assistant", f"I found information {description} in your earlier answers. Please review it below.")
+    return True
+
+
+def review_activated_followups():
+    state = st.session_state.carryover
+    for questionnaire in QUESTIONNAIRES:
+        field_sources = {}
+        for child_id in bridge.get_active_conditional_fields(questionnaire):
+            if child_id not in state["queued"] or child_id in bridge.answers:
+                continue
+            source_id, parent_value = state["queued"].pop(child_id)
+            parent_id, _ = CONDITIONAL_FIELDS[child_id]
+            evidence = evidence_key(state["turns"][source_id]["message"])
+            attempt = (child_id, evidence)
+            if bridge.answers[parent_id] == parent_value and attempt not in state["attempted"]:
+                state["attempted"].add(attempt)
+                field_sources[child_id] = [source_id]
+        if open_carryover_review(questionnaire, field_sources):
+            return True
+    return False
+
+
+def review_d22_handoff():
+    state = st.session_state.carryover
+    if state["handoff_done"]:
+        return False
+    state["handoff_done"] = True
+    turns = [source_id for source_id, turn in state["turns"].items() if turn["questionnaire"] == "D2.1"]
+    confirmed = [source_id for source_id in reversed(turns) if source_id in state["confirmed_sources"]]
+    selected = list(dict.fromkeys(turns[:1] + confirmed[:3] + turns[-6:]))[:6]
+    selected.sort(key=int)
+    return open_carryover_review("D2.2", dict.fromkeys(pending_fields("D2.2"), selected), handoff=True)
+
+
 def process_next_question():
     """
     Continue the conversation while respecting active
@@ -247,6 +384,9 @@ def process_next_question():
         return
 
     if not st.session_state.needs_next_question:
+        return
+
+    if review_activated_followups():
         return
 
     current_field = st.session_state.asked_field
@@ -274,6 +414,9 @@ def process_next_question():
     # Otherwise, find the next active unanswered field.
     next_field = get_next_field()
 
+    if next_field and questionnaire_for_field(next_field) == "D2.2" and review_d22_handoff():
+        return
+
     ask_question(next_field)
 
 
@@ -283,6 +426,7 @@ def process_next_question():
 
 def confirm_answer(field_id, value):
 
+    active_before = bridge.get_active_conditional_fields(questionnaire_for_field(field_id))
     valid, error = bridge.save_answer(
         field_id,
         value,
@@ -290,6 +434,8 @@ def confirm_answer(field_id, value):
 
     if not valid:
         return False, error
+
+    queue_activated_followups(field_id, value, active_before)
 
     st.session_state.field_suggestions.pop(
         field_id,
@@ -309,6 +455,14 @@ def confirm_answer(field_id, value):
 
 def reject_answer(field_id):
 
+    state = st.session_state.carryover
+    evidence = state["evidence"].pop(field_id, None)
+    if evidence:
+        source = state["turns"][evidence["source_id"]]["message"]
+        state["rejected"].setdefault(field_id, set()).add(
+            (evidence_key(source), evidence_key(evidence["quote"]))
+        )
+
     st.session_state.field_suggestions.pop(
         field_id,
         None,
@@ -325,6 +479,7 @@ def reset_application():
         "questionnaire_bridge",
         "unified_messages",
         "field_suggestions",
+        "carryover",
         "asked_field",
         "asked_question",
         "retryable_turn",
@@ -383,6 +538,7 @@ def restore_profile(uploaded_file):
             if not valid:
                 return False, f"{field_id}: {error}"
     st.session_state.retryable_turn = None
+    st.session_state.carryover = new_carryover_state()
     st.session_state.questionnaire_bridge = candidate
     st.session_state.field_suggestions = {}
     st.session_state.asked_field = None
@@ -592,6 +748,9 @@ with chat_tab:
                 display_label,
                 expanded=True,
             ):
+                evidence = st.session_state.carryover["evidence"].get(field_id)
+                if evidence and evidence.get("carried"):
+                    st.caption(f'Earlier answer: “{evidence["quote"]}”')
 
                 widget_key = (
                     f"review_{field_id}_"
@@ -711,10 +870,12 @@ with chat_tab:
     )
 
     if user_message:
+        source_id = str(len(st.session_state.unified_messages))
         add_message("user", user_message)
         st.session_state.intake_started = True
     elif retry_clicked:
         user_message = retryable_turn["message"]
+        source_id = retryable_turn["source_id"]
 
     if user_message:
         with st.spinner("Gemini is analyzing your response..."):
@@ -737,10 +898,24 @@ with chat_tab:
                         target_question=current_question,
                         questionnaire=questionnaire,
                     )
+                    state = st.session_state.carryover
+                    state["turns"][source_id] = {
+                        "message": user_message,
+                        "questionnaire": questionnaire,
+                        "question": current_question,
+                    }
+                    extracted = {
+                        field_id: value for field_id, value in extracted.items()
+                        if not was_rejected(field_id, user_message)
+                    }
 
                     if extracted:
                         st.session_state.review_batch_version += 1
                         st.session_state.field_suggestions.update(extracted)
+                        state["evidence"].update({
+                            field_id: {"source_id": source_id, "quote": user_message, "value": value}
+                            for field_id, value in extracted.items()
+                        })
                         add_message(
                             "assistant",
                             f"I identified {len(extracted)} potential questionnaire "
@@ -760,6 +935,7 @@ with chat_tab:
                 st.session_state.retryable_turn = {
                     "message": user_message,
                     "context": question_context,
+                    "source_id": source_id,
                 }
                 print(f"Chat Buddy processing error: {error}")
             else:
@@ -868,6 +1044,7 @@ with manual_tab:
 
                 else:
 
+                    active_before = bridge.get_active_conditional_fields(questionnaire_for_field(field_id))
                     valid, error = bridge.save_answer(
                         field_id,
                         value,
@@ -876,6 +1053,7 @@ with manual_tab:
                     if valid:
 
                         st.session_state.editor_version += 1
+                        queue_activated_followups(field_id, value, active_before)
 
                         suggestions = st.session_state.field_suggestions
                         suggestions.pop(field_id, None)
@@ -887,6 +1065,10 @@ with manual_tab:
                         inactive_conditionals = CONDITIONAL_FIELDS.keys() - active_conditionals
                         for child_id in suggestions.keys() & inactive_conditionals:
                             suggestions.pop(child_id)
+                            st.session_state.carryover["evidence"].pop(child_id, None)
+                        queued = st.session_state.carryover["queued"]
+                        for child_id in queued.keys() & (inactive_conditionals | {field_id}):
+                            queued.pop(child_id)
 
                         current_field = st.session_state.asked_field
                         if (
