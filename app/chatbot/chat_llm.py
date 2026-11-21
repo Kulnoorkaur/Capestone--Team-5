@@ -631,6 +631,37 @@ def generate_questionnaire_question(
     if confirmed_answers is not None and not isinstance(confirmed_answers, dict):
         raise ValueError("confirmed_answers must be a dictionary.")
 
+    # D2.1 field labels and help text from product_profile.py, phrased as questions.
+    canonical_d21 = {
+        "PIP-001": "What is the name of your product, and what version are you describing?",
+        "PIP-002": "What is your product's intended medical purpose, such as diagnosis, monitoring, prediction, or treatment support?",
+        "PIP-003": "What clinical problem or medical condition is your product intended to address?",
+        "PIP-004": "How will your product be used in clinical practice?",
+        "PIP-005": "What anatomical region does your product focus on?",
+        "PIP-006": "What imaging modality does your product use?",
+        "PIP-007": "Which user roles is your product intended for?",
+        "PIP-008": "Is your product intended for healthcare professionals only, for patients or caregivers, or for both?",
+        "PIP-009": "Do intended users need specialized training to use your product?",
+        "PIP-010": (
+            "What professional qualifications or product-specific training do users need? "
+            "If none apply, enter 'None'."
+        ),
+        "PIP-011": "What patient age range is your product intended for?",
+        "PIP-012": "What patient population is your product intended for?",
+        "PIP-013": "Which patient groups are excluded from use? If there are no exclusions, enter 'None'.",
+        "PIP-014": "What restrictions apply to patients based on age, clinical condition, or other characteristics?",
+        "PIP-015": "What clinical criteria determine whether a patient is eligible for use?",
+        "PIP-016": "In which clinical settings is your product intended to be used?",
+        "PIP-017": "In which care context is your product intended to be used?",
+        "PIP-018": "Is your product intended for routine use, time-critical use, or both?",
+        "PIP-019": "At what stage of the clinical workflow will your product be used?",
+        "PIP-020": "What are the main functions your imaging AI product performs?",
+        "PIP-021": "What types of images or imaging information does your product process?",
+        "PIP-022": "Which of the listed operations does your product perform?",
+        "PIP-023": "How are healthcare professionals or other intended users expected to use the results?",
+        "PIP-024": "Which uses are outside your product's intended use, and what limitations are known?",
+    }
+
     # Exact prompts from app/deliverable_2/questionnaires/ai_function.py.
     canonical_d22 = {
         "AIF-001": "What input information does the software use?",
@@ -663,7 +694,9 @@ def generate_questionnaire_question(
         "AIF-019-DETAILS": "Describe the actions, triggers, and safeguards.",
     }
 
-    if field_id in canonical_d22:
+    if field_id in canonical_d21:
+        question = canonical_d21[field_id]
+    elif field_id in canonical_d22:
         question = canonical_d22[field_id]
     elif field_id in canonical_followups:
         question = canonical_followups[field_id]
@@ -692,8 +725,6 @@ def generate_questionnaire_question(
             "Could you briefly describe what you mean?"
         )
     else:
-        # D2.1 questionnaire uses its field labels as the original input labels.
-        # Never ask Gemini to reinterpret a short regulatory label.
         question = f"Please provide the following product information: {field_label}."
 
     if field_options:
