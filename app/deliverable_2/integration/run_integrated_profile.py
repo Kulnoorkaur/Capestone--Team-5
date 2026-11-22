@@ -507,9 +507,10 @@ def clear_assessment():
 
 def select_answer_source(use_import):
     st.session_state["d26-use-chatbot-profile"] = use_import
-    st.session_state["d26-use-chatbot-algorithms"] = (
-        use_import and "algorithms" in st.session_state["d26-chatbot-profile"]
-    )
+    for section in ("algorithms", "dataset_evidence"):
+        st.session_state[f"d26-use-chatbot-{section}"] = (
+            use_import and section in st.session_state["d26-chatbot-profile"]
+        )
     clear_assessment()
 
 
@@ -521,7 +522,7 @@ def load_chatbot_import(raw):
     if not isinstance(envelope, dict) or not {"schema", "version", "algorithms"} & envelope.keys():
         return load_confirmed_profile(raw)
 
-    profile = load_combined_profile(raw)
+    profile = load_combined_profile(raw, allow_d24=True)
     algorithms = []
     for algorithm_id in profile.algorithms.algorithm_ids:
         identity = profile.algorithms.get_algorithm(algorithm_id)
@@ -530,11 +531,15 @@ def load_chatbot_import(raw):
             **record, "algorithm_id": algorithm_id,
             "name": identity["name"], "version": identity["version"],
         })
-    return {
+    imported = {
         "product": profile.bridge.get_questionnaire_answers("D2.1"),
         "ai_function": profile.bridge.get_questionnaire_answers("D2.2"),
         "algorithms": algorithms,
     }
+    if profile.dataset_evidence is not None:
+        imported["dataset_evidence"] = profile.dataset_evidence.native_profile()
+        imported["dataset_findings"] = profile.dataset_evidence.validate()
+    return imported
 
 
 def render_import_preview(profile):
@@ -573,6 +578,38 @@ def render_import_preview(profile):
                     st.dataframe(record["flags"], hide_index=True)
                 if not record["validation_problems"] and not record["flags"]:
                     st.caption("No D2.3 validation gaps or flags.")
+    if "dataset_evidence" in profile:
+        datasets = profile["dataset_evidence"]
+        with st.expander("D2.4 Dataset and Evidence", expanded=True):
+            st.caption(
+                f"{len(datasets['datasets'])} datasets, {len(datasets['ai_function_versions'])} "
+                f"evaluation records, {len(datasets['evidence_documents'])} supporting documents"
+            )
+            st.json(datasets, expanded=False)
+            if profile["dataset_findings"]:
+                st.warning("The D2.4 questionnaire has validation findings. You can still use this profile.")
+                st.dataframe(profile["dataset_findings"], hide_index=True)
+            else:
+                st.caption("No findings from the D2.4 questionnaire validator.")
+
+
+def render_section_source(profile, section, label):
+    if section not in profile:
+        return
+    key = f"d26-use-chatbot-{section}"
+    use_imported = st.session_state.get(key, False)
+    if st.button(f"Use {'manual' if use_imported else 'imported'} {label}"):
+        st.session_state[key] = not use_imported
+        clear_assessment()
+        st.rerun()
+    st.caption(f"Evaluation uses {'imported' if use_imported else 'manual'} {label}.")
+
+
+def retained_sections(*, use_algorithms, use_datasets):
+    return ", ".join(
+        section for section, imported in (("D2.3", use_algorithms), ("D2.4", use_datasets), ("D2.5", False))
+        if not imported
+    )
 
 
 def render_chatbot_import():
@@ -585,7 +622,9 @@ def render_chatbot_import():
             st.error(str(error))
         else:
             render_import_preview(preview)
-            retained = "D2.4–D2.5" if "algorithms" in preview else "D2.3–D2.5"
+            retained = retained_sections(
+                use_algorithms="algorithms" in preview, use_datasets="dataset_evidence" in preview,
+            )
             st.info(
                 f"Existing {retained} and integration inputs will be retained for assessment. "
                 "They must describe the same product and version as this profile."
@@ -605,18 +644,8 @@ def render_chatbot_import():
         st.caption("Evaluation uses the accepted Chat Buddy profile for D2.1 and D2.2. Manual drafts are kept.")
         product_identity = accepted["product"].get("PIP-001", "Not provided")
         st.text(f"Accepted product and version: {product_identity}")
-        if "algorithms" in accepted:
-            use_algorithms = st.session_state["d26-use-chatbot-algorithms"]
-            label = "Use manual D2.3 records" if use_algorithms else "Use imported D2.3 records"
-            if st.button(label):
-                use_algorithms = not use_algorithms
-                st.session_state["d26-use-chatbot-algorithms"] = use_algorithms
-                clear_assessment()
-                st.rerun()
-            if use_algorithms:
-                st.caption(f"Evaluation uses {len(accepted['algorithms'])} imported D2.3 records.")
-            else:
-                st.caption("Evaluation uses manual D2.3 records.")
+        render_section_source(accepted, "algorithms", "D2.3 records")
+        render_section_source(accepted, "dataset_evidence", "D2.4 records")
         return accepted
     st.caption("Evaluation uses manual D2.1 and D2.2 answers.")
     return None
@@ -653,7 +682,14 @@ with pages[2]:
     if use_imported_algorithms:
         algorithms = imported_profile["algorithms"]
 with pages[3]:
+    use_imported_datasets = (
+        imported_profile is not None and st.session_state.get("d26-use-chatbot-dataset_evidence", False)
+    )
+    if use_imported_datasets:
+        st.info("Evaluation uses the imported D2.4 records. The controls below retain your manual drafts.")
     datasets = render_dataset_evidence()
+    if use_imported_datasets:
+        datasets = imported_profile["dataset_evidence"]
 with pages[4]:
     risk = render_risk_documentation()
 with pages[5]:
@@ -680,7 +716,7 @@ with pages[6]:
              "are routed to manual regulatory review; no automatic legal classification is issued.")
     can_evaluate = True
     if imported_profile is not None:
-        retained = "D2.4–D2.5" if use_imported_algorithms else "D2.3–D2.5"
+        retained = retained_sections(use_algorithms=use_imported_algorithms, use_datasets=use_imported_datasets)
         st.warning(
             f"{retained} and integration inputs are retained from this session. "
             "Check that they apply to the imported product and version before evaluating."
@@ -701,6 +737,13 @@ with pages[6]:
                                                   matrix_questions)
     result = st.session_state.get("d26-results")
     if result:
+        if use_imported_datasets:
+            with st.expander("D2.4 validation findings for the assessed profile"):
+                findings = imported_profile["dataset_findings"]
+                if findings:
+                    st.dataframe(findings, hide_index=True)
+                else:
+                    st.caption("No findings from the D2.4 questionnaire validator.")
         a, b, c = st.columns(3)
         a.metric("Profile data dictionary fields", result["dictionary_count"])
         b.metric("D1.6 requirement records", result["matrix_requirement_count"])

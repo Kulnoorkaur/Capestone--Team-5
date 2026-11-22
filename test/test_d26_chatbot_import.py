@@ -10,6 +10,7 @@ from streamlit.testing.v1 import AppTest
 
 from app.chatbot import chat_llm
 from app.chatbot.d23_adapter import D23AnswerAdapter
+from app.chatbot.d24_adapter import D24AnswerAdapter
 from app.chatbot.profile_io import dump_combined_profile
 from app.chatbot.questionnaire_bridge import QuestionnaireBridge
 from app.deliverable_2.questionnaires.algorithm_change_control import LOCKED, build_record
@@ -248,3 +249,132 @@ class D26ChatBuddyImportTests(unittest.TestCase):
         self.assertTrue(self.button("Evaluate integrated profile").disabled)
         self.app.checkbox(key="d26-retained-inputs-ack").check().run()
         self.assertEqual(self.evaluate()["algorithms"], manual["algorithms"])
+
+    def test_version_two_import_projects_native_d24_and_preserves_source_isolation(self):
+        self.app.text_input(key="d26-model-0-name").set_value("Manual model")
+        self.app.text_input(key="dataset-0-DEP-001-name").set_value("Manual dataset draft")
+        self.app.text_input(key="document-0-id").set_value("Manual evidence draft")
+        self.app.run()
+        manual = self.evaluate()
+        manual_results = copy.deepcopy(self.app.session_state["d26-results"])
+        bridge = QuestionnaireBridge()
+        self.assertTrue(bridge.save_answer("PIP-001", "Demo product v2")[0])
+        self.assertTrue(bridge.save_answer("AIF-019", "No")[0])
+        algorithms = D23AnswerAdapter()
+        algorithms.add_algorithm("Imported model", "2", algorithm_id="model-a")
+        algorithms.add_algorithm("Imported model", "2.1", algorithm_id="model-b")
+        adapter = D24AnswerAdapter()
+        for index in (1, 2):
+            dataset = adapter.create_record("dataset")
+            adapter.save_answer(dataset, "DEP-001.dataset_name_version", f"Cohort {index}")
+            adapter.save_answer(dataset, "DEP-001.role", ["Other"])
+            adapter.save_answer(dataset, "DEP-001.role_other", f"Calibration cohort {index}")
+            adapter.save_answer(dataset, "DEP-003", "Unknown")
+            evaluation = adapter.create_record("function")
+            adapter.save_answer(evaluation, "DEP-019-versions", f"Model v2.{index}")
+            adapter.save_answer(evaluation, "DEP-028", ["Literature only"])
+            adapter.save_answer(evaluation, "DEP-033", "Published evidence review")
+            document = adapter.create_record("document")
+            adapter.save_answer(document, "document_id", f"Reference {index}")
+        adapter.save_answer(adapter.GMLP, "DEP-036-trigger", "Yes")
+        adapter.save_answer(adapter.GMLP, "DEP-036", "Partly")
+        adapter.save_answer(adapter.GMLP, "DEP-036-document", "Reference 1 §2")
+        backup = dump_combined_profile(bridge, algorithms, dataset_evidence=adapter)
+        expected = adapter.native_profile()
+
+        self.upload(backup)
+        self.assertTrue(any("2 datasets, 2 evaluation records, 2 supporting documents" in item.value
+                            for item in self.app.caption))
+        self.assertIn(expected, [json.loads(item.value) for item in self.app.json])
+        self.assertTrue(any("D2.4 questionnaire has validation findings" in item.value for item in self.app.warning))
+        self.assertEqual(self.app.session_state["d26-profile"], manual)
+        self.assertEqual(self.app.session_state["d26-results"], manual_results)
+        self.assertTrue(self.app.get("download_button"))
+        self.assertNotIn("d26-chatbot-profile", self.app.session_state)
+
+        self.click("Use this profile")
+        self.assert_results_cleared()
+        self.assertTrue(self.button("Evaluate integrated profile").disabled)
+        self.app.checkbox(key="d26-retained-inputs-ack").check().run()
+        imported = self.evaluate()
+        imported_results = copy.deepcopy(self.app.session_state["d26-results"])
+        self.assertEqual(imported.keys(), manual.keys())
+        self.assertEqual(imported_results.keys(), manual_results.keys())
+        self.assertEqual(imported["dataset_evidence"], expected)
+        self.assertEqual(imported["product"]["PIP-001"], "Demo product v2")
+        self.assertEqual(imported["ai_function"]["AIF-019"], "No")
+        self.assertEqual(imported["algorithms"][0]["record_name"], "Imported model — 2")
+        self.assertEqual([model["algorithm_id"] for model in imported["algorithms"]], ["model-a", "model-b"])
+        self.assertEqual(self.app.session_state["d26-chatbot-profile"]["dataset_findings"], adapter.validate())
+        findings_view = next(item for item in self.app.expander
+                             if item.label == "D2.4 validation findings for the assessed profile")
+        self.assertEqual(
+            json.loads(findings_view.get("dataframe")[0].value.to_json(orient="records")),
+            adapter.validate(),
+        )
+        self.assertEqual(expected["datasets"][0]["DEP-001"]["dataset_name_version"], "Cohort 1")
+        self.assertEqual(expected["datasets"][1]["DEP-001"]["role_other"], "Calibration cohort 2")
+        self.assertEqual(expected["datasets"][0]["DEP-003"], "Unknown")
+        self.assertEqual(expected["datasets"][0]["DEP-005"], "")
+        self.assertEqual(expected["ai_function_versions"][1]["DEP-033"], "Published evidence review")
+        self.assertEqual(expected["DEP-036-document"], "Reference 1 §2")
+        for collection in ("datasets", "ai_function_versions", "evidence_documents"):
+            self.assertTrue(all("record_id" not in record for record in expected[collection]))
+
+        cases = (
+            (("dataset_evidence", "datasets", 0, "answers", "DEP-999"), "Unknown", "Unknown field IDs"),
+            (("dataset_evidence", "datasets", 0, "answers", "DEP-003"), "Unsupported", "allowed option"),
+            (("dataset_evidence", "datasets", 0, "answers", "DEP-012"), "Inactive", "inactive field"),
+            (("dataset_evidence", "datasets", 1, "record_id"), "dataset-1", "Duplicate D2.4 record ID"),
+            (("dataset_evidence", "questionnaire_sha256"), "unreviewed", "compatibility manifest requires review"),
+            (("version",), 9, "Unsupported combined profile version"),
+        )
+        for path, value, diagnostic in cases:
+            with self.subTest(path=path):
+                invalid = json.loads(backup)
+                destination = invalid
+                for key in path[:-1]:
+                    destination = destination[key]
+                destination[path[-1]] = value
+                self.upload(invalid)
+                self.assertTrue(any(diagnostic in item.value for item in self.app.error))
+                self.assertNotIn("Use this profile", [button.label for button in self.app.button])
+                self.assertEqual(self.app.session_state["d26-profile"], imported)
+                self.assertEqual(self.app.session_state["d26-results"], imported_results)
+                self.assertTrue(self.app.get("download_button"))
+                self.assertEqual(self.app.text_input(key="dataset-0-DEP-001-name").value, "Manual dataset draft")
+                self.assertEqual(self.app.text_input(key="d26-model-0-name").value, "Manual model")
+
+        self.click("Use manual D2.3 records")
+        self.assert_results_cleared()
+        self.assertTrue(self.app.session_state["d26-use-chatbot-dataset_evidence"])
+        self.assertTrue(self.button("Evaluate integrated profile").disabled)
+        self.app.checkbox(key="d26-retained-inputs-ack").check().run()
+        self.assertEqual(self.evaluate(), {**imported, "algorithms": manual["algorithms"]})
+
+        self.click("Use manual D2.4 records")
+        self.assert_results_cleared()
+        self.assertFalse(self.app.session_state["d26-use-chatbot-algorithms"])
+        self.assertTrue(self.button("Evaluate integrated profile").disabled)
+        self.app.checkbox(key="d26-retained-inputs-ack").check().run()
+        self.assertEqual(self.evaluate(), {
+            **imported, "algorithms": manual["algorithms"], "dataset_evidence": manual["dataset_evidence"],
+        })
+        self.click("Use imported D2.3 records")
+        self.assert_results_cleared()
+        self.assertFalse(self.app.session_state["d26-use-chatbot-dataset_evidence"])
+        self.assertTrue(self.button("Evaluate integrated profile").disabled)
+        self.app.checkbox(key="d26-retained-inputs-ack").check().run()
+        manual_d24 = self.evaluate()
+        self.assertEqual(manual_d24, {**imported, "dataset_evidence": manual["dataset_evidence"]})
+        self.assertEqual(self.app.text_input(key="document-0-id").value, "Manual evidence draft")
+
+        self.upload(dump_combined_profile(bridge, algorithms))
+        self.assertEqual(self.app.session_state["d26-profile"], manual_d24)
+        self.assertTrue(self.app.get("download_button"))
+        self.click("Use this profile")
+        self.assert_results_cleared()
+        self.assertFalse(any("D2.4 records" in button.label for button in self.app.button))
+        self.assertTrue(self.button("Evaluate integrated profile").disabled)
+        self.app.checkbox(key="d26-retained-inputs-ack").check().run()
+        self.assertEqual(self.evaluate()["dataset_evidence"], manual["dataset_evidence"])
