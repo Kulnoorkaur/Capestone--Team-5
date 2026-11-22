@@ -53,33 +53,58 @@ def unknown_option(kind, options):
     return None
 
 
-def render_record_proposal(key, question, *, algorithm=False):
+def propose_record_identity(message, *, algorithm=False, include_version=True):
+    """Recognize a short identity statement without consuming its description."""
+    first = re.split(r"(?<=[.!?])\s+|[\r\n]+", message.strip(), maxsplit=1)[0].rstrip(".!?")
+    named = re.match(
+        r"^(?:(?:our|my|the)\s+)?(?:algorithm|model|dataset|evaluation|(?:supporting )?document|report)"
+        r"(?:\s+(?:name|title))?\s+(?:is called|is named|is titled|is|called|entitled)\s+",
+        first, re.I,
+    )
+    identity = first[named.end():].strip() if named else first
+    match = re.fullmatch(
+        r"(.+?)(?:[, ]+|\s*\()(?:version\s*[:=]?\s*|v\s*)(\d[\w.-]*)\)?",
+        identity, re.I,
+    )
+    version = ""
+    if match:
+        identity, version = match[1].strip(), match[2]
+    elif ambiguous := re.search(r"[, (]+version\b(?=\s|[:=]|$)", identity, re.I):
+        identity = identity[:ambiguous.start()].strip()
+    # Leave the proposal blank when the initial sentence reads like a
+    # description or several possible names instead of a single identity.
+    if len(identity) > 120 or re.search(
+        r"[,;:]|\b(?:either|or|maybe|possibly|unsure|unknown|uses?|contains?|includes?|"
+        r"detects?|analy[sz]es?|evaluates?|compares?|measures?|process(?:es)?|supports?|"
+        r"has|have|is|are|was|were|will)\b"
+        r"|^(?:a|an|i|we|it|they|this|yes|no)\b",
+        identity, re.I,
+    ):
+        return "", ""
+    if version and not algorithm and include_version:
+        identity = f"{identity}, version {version}"
+    return identity, version if algorithm else ""
+
+
+def render_record_proposal(key, question, *, algorithm=False, include_version=True):
     """Collect an identity draft from chat. Only return it after confirmation."""
     state = st.session_state
     with st.chat_message("assistant"):
         st.write(question)
     message = st.chat_input("Describe the new record", key=f"{key}-message", max_chars=8000)
     if message and message.strip():
-        text = message.strip()
-        identity = text.splitlines()[0]
-        identity = re.sub(
-            r"^(?:our |my |the )?(?:algorithm|model|dataset|evaluation|document)(?: name)? (?:is called|is|called)\s+",
-            "", identity, flags=re.I,
-        ).strip()
-        version = ""
-        if algorithm:
-            match = re.fullmatch(r"(.+?)[, ]+(?:version\s*|v)([\w.-]+)[.!]?", identity, re.I)
-            if match:
-                identity, version = match[1].strip(), match[2].rstrip(".")
+        identity, version = propose_record_identity(message, algorithm=algorithm, include_version=include_version)
         generation = state.get("ux_record_proposal_generation", 0) + 1
         state.ux_record_proposal_generation = generation
-        state[key] = (text, identity, version, generation)
+        state[key] = (message, identity, version, generation)
         st.rerun()
     if key not in state:
         return None
     text, proposed_name, proposed_version, draft_id = state[key]
     with st.chat_message("user"):
         st.text(text)
+    if not proposed_name or (algorithm and not proposed_version):
+        st.caption("Review the proposed identity. Enter the name and any version you can confirm.")
     with st.form(f"{key}-confirm-form-{draft_id}"):
         name = st.text_input("Record name", value=proposed_name, key=f"{key}-name-{draft_id}")
         version = (

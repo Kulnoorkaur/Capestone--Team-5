@@ -91,7 +91,19 @@ def _evidence_key(value):
     return " ".join(value.casefold().split())
 
 
-def _submit_turn(conversation, algorithm_id, algorithm, active, field_id, message, other_names):
+def _algorithm_conversation(conversations, algorithm_id):
+    return conversations.setdefault(algorithm_id, {
+        "turns": [], "candidates": {}, "rejected": {}, "skipped": set(), "notice": "",
+    })
+
+
+def _submit_turn(adapter, conversation, algorithm_id, field_id, message, *, initial=False):
+    algorithm = adapter.get_algorithm(algorithm_id)
+    active = adapter.active_field_ids(algorithm_id)
+    other_names = [
+        adapter.get_algorithm(other_id)["name"]
+        for other_id in adapter.algorithm_ids if other_id != algorithm_id
+    ]
     conversation["turns"].append(message)
     source_id = str(len(conversation["turns"]))
     try:
@@ -113,7 +125,7 @@ def _submit_turn(conversation, algorithm_id, algorithm, active, field_id, messag
             continue
         conversation["candidates"][field] = candidate
     conversation["notice"] = clarification or (
-        "" if suggestions else "I couldn't identify a supported answer. Could you clarify the detail for this algorithm?"
+        "" if suggestions or initial else "I couldn't identify a supported answer. Could you clarify the detail for this algorithm?"
     )
 
 
@@ -349,8 +361,11 @@ def render_d23_chat():
                 new_id = adapter.add_algorithm(name, version)
                 adapter.save_answer(new_id, "ACC-001", f"{name} {version}".strip())
                 state["ux_select_algorithm"] = new_id
-                state.setdefault("ux_d23_introductions", {})[new_id] = introduction
                 state.pop("ux_d23_add", None)
+                conversation = _algorithm_conversation(conversations, new_id)
+                answers = adapter.get_algorithm(new_id)["answers"]
+                target = next((field for field in adapter.active_field_ids(new_id) if field not in answers), None)
+                _submit_turn(adapter, conversation, new_id, target, introduction, initial=True)
                 st.rerun()
             return
 
@@ -361,9 +376,7 @@ def render_d23_chat():
     )
     state.d23_active_algorithm_id = algorithm_id
     algorithm = adapter.get_algorithm(algorithm_id)
-    conversation = conversations.setdefault(algorithm_id, {
-        "turns": [], "candidates": {}, "rejected": {}, "skipped": set(), "notice": "",
-    })
+    conversation = _algorithm_conversation(conversations, algorithm_id)
     active = adapter.active_field_ids(algorithm_id)
     pending = [field for field in active if not _complete(field, algorithm["answers"].get(field, {}))]
     target = next((field for field in pending if field not in conversation["skipped"]), None)
@@ -410,11 +423,7 @@ def render_d23_chat():
             key=f"d23-chat-input-{algorithm_id}", disabled=bool(suggestions),
         )
         if message and message.strip() and not suggestions:
-            other_names = [
-                adapter.get_algorithm(other_id)["name"]
-                for other_id in adapter.algorithm_ids if other_id != algorithm_id
-            ]
-            _submit_turn(conversation, algorithm_id, algorithm, active, target, message, other_names)
+            _submit_turn(adapter, conversation, algorithm_id, target, message)
             st.rerun()
     with tools:
         _manual_algorithm_answers(adapter, algorithm_id, algorithm, conversation, active, pending, target)

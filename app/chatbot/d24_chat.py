@@ -78,8 +78,19 @@ def _render_extraction(adapter, record_id, scope, target, conversation):
     )
     if not message:
         return
+    _submit_record_turn(adapter, record_id, scope, target, conversation, message)
+    st.rerun()
+
+
+def _record_conversation(conversations, record_id):
+    return conversations.setdefault(record_id, {"turns": [], "pending": {}, "notice": ""})
+
+
+def _submit_record_turn(adapter, record_id, scope, target, conversation, message, *, initial=False):
     turns = conversation["turns"]
     source_id = str(len(turns) + 1)
+    previous = tuple(turns[-6:])
+    turns.append(message)
     conversation["pending"] = {}
     labels = {}
     for kind, (_, name_field) in _RECORDS.items():
@@ -95,7 +106,7 @@ def _render_extraction(adapter, record_id, scope, target, conversation):
                 confirmed=adapter.get_answers(record_id),
                 other_labels=tuple(label for other_id, name in labels.items() if other_id != record_id
                                    for label in (other_id, name)),
-                previous=tuple(turns[-6:]),
+                previous=previous,
             )
     except Exception:
         conversation["notice"] = "Gemini could not process this message. You can continue with the manual controls."
@@ -103,11 +114,9 @@ def _render_extraction(adapter, record_id, scope, target, conversation):
         conversation["pending"] = suggestions
         _reconcile_suggestions(adapter, record_id, conversation)
         conversation["notice"] = clarification or (
-            "" if suggestions and conversation["pending"]
+            "" if initial or (suggestions and conversation["pending"])
             else "I couldn't verify an answer for this record. Please clarify or use the manual controls."
         )
-    turns.append(message)
-    st.rerun()
 
 
 def _render_suggestions(adapter, record_id, active, revision, conversation):
@@ -206,9 +215,7 @@ def _render_record(adapter, record_id, scope, tools):
     findings = adapter.validate_record(record_id)
     required = _required_findings(findings)
     revision = st.session_state.d24_revisions.get(record_id, 0)
-    conversation = st.session_state.d24_conversations.setdefault(
-        record_id, {"turns": [], "pending": {}, "notice": ""},
-    )
+    conversation = _record_conversation(st.session_state.d24_conversations, record_id)
     skipped = conversation.setdefault("skipped", set())
     skipped.intersection_update(set(active) - answers.keys())
     target = _next_required_field(active, answers, required, skipped)
@@ -363,14 +370,19 @@ def render_d24_chat():
                 "What dataset would you like to start with?"
                 if kind == "dataset" else f"Which {labels[kind].lower()} would you like to document?"
             )
-            proposed = render_record_proposal(f"ux_d24_proposal_{kind}", question)
+            proposed = render_record_proposal(f"ux_d24_proposal_{kind}", question, include_version=kind != "document")
             if proposed:
                 name, _, introduction = proposed
                 new_id = adapter.create_record(kind)
                 adapter.save_answer(new_id, _RECORDS[kind][1], name)
                 state["ux_resume_dataset"] = (kind, new_id, None)
-                state.setdefault("ux_d24_introductions", {})[new_id] = introduction
                 state.pop("ux_d24_add", None)
+                conversation = _record_conversation(conversations, new_id)
+                target = _next_required_field(
+                    adapter.active_fields(new_id), adapter.get_answers(new_id),
+                    _required_findings(adapter.validate_record(new_id)),
+                )
+                _submit_record_turn(adapter, new_id, kind, target, conversation, introduction, initial=True)
                 st.rerun()
             if record_id is None:
                 st.caption(f"Add a {labels[kind].lower()} to begin.")
