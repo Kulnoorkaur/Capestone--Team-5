@@ -158,11 +158,11 @@ class _Compiler:
         self.renderer = functions["render_dataset_evidence"]
         self.programs = {}
 
-    def compile(self):
+    def compile(self, fingerprint):
         self.programs["gmlp"] = self._block(self.renderer.body, "gmlp")
         if set(self.programs) != {"gmlp", *self.sections}:
             raise D24CompatibilityError("Native record sections changed.")
-        return _Metadata(self.sections, self.programs)
+        return _Metadata(self.sections, self.programs, fingerprint)
 
     def _block(self, statements, scope):
         program = []
@@ -290,6 +290,18 @@ class _Compiler:
 class _Metadata:
     sections: dict
     programs: dict
+    fingerprint: str
+
+    def field_ids(self, scope):
+        def collect(program):
+            for instruction in program:
+                if isinstance(instruction, _Branch):
+                    yield from collect(instruction.when_true)
+                    yield from collect(instruction.when_false)
+                elif instruction.field_id is not None:
+                    yield instruction.field_id
+
+        return tuple(dict.fromkeys(collect(self.programs[scope])))
 
     def project(self, scope, confirmed):
         values, fields, local = {}, {}, {}
@@ -319,7 +331,7 @@ class _Metadata:
         return {**native, **local}, fields
 
 
-def load_metadata(source_path=SOURCE, manifest_path=MANIFEST):
+def _reviewed_source(source_path, manifest_path):
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         source = source_path.read_bytes()
@@ -327,10 +339,28 @@ def load_metadata(source_path=SOURCE, manifest_path=MANIFEST):
             raise D24CompatibilityError("Unsupported manifest schema or version.")
         if sha256(source).hexdigest() != manifest["source_sha256"]:
             raise D24CompatibilityError("The owner questionnaire source fingerprint changed.")
-        return _Compiler(ast.parse(source), manifest).compile()
+        return source, manifest
     except D24CompatibilityError:
         raise
     except OSError:
         raise D24CompatibilityError("The owner questionnaire source or manifest could not be read.") from None
+    except (SyntaxError, ValueError, TypeError, KeyError, AttributeError, IndexError):
+        raise D24CompatibilityError("The owner questionnaire source or manifest could not be interpreted.") from None
+
+
+def check_metadata_compatibility(fingerprint):
+    _, manifest = _reviewed_source(SOURCE, MANIFEST)
+    if manifest["source_sha256"] != fingerprint:
+        raise D24CompatibilityError(
+            "The reviewed questionnaire changed during this session. Editing is disabled to preserve confirmed answers."
+        )
+
+
+def load_metadata(source_path=SOURCE, manifest_path=MANIFEST):
+    source, manifest = _reviewed_source(source_path, manifest_path)
+    try:
+        return _Compiler(ast.parse(source), manifest).compile(manifest["source_sha256"])
+    except D24CompatibilityError:
+        raise
     except (SyntaxError, ValueError, TypeError, KeyError, AttributeError, IndexError):
         raise D24CompatibilityError("The owner questionnaire source or manifest could not be interpreted.") from None

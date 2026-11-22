@@ -24,6 +24,7 @@ from app.chatbot.chat_llm import (
 )
 
 from app.chatbot.d23_chat import render_d23_chat
+from app.chatbot.d24_chat import render_d24_chat
 from app.chatbot.profile_io import (
     CombinedProfile,
     ProfileImportError,
@@ -503,6 +504,9 @@ def reset_application():
         "d23_answer_revision",
         "d23_conversations",
         "d23-algorithm-picker",
+        "d24_mode",
+        "d24_adapter",
+        "d24_revisions",
     ]
 
     for key in keys:
@@ -559,6 +563,7 @@ def restore_profile(uploaded_file):
     st.session_state.intake_started = True
     st.session_state.questionnaire_complete = False
     st.session_state.d23_mode = False
+    st.session_state.d24_mode = False
     st.session_state.needs_next_question = True
     st.session_state.clarification_needed = False
     st.session_state.editor_version += 1
@@ -590,6 +595,7 @@ def apply_combined_profile(profile: CombinedProfile):
         editor_version=state.editor_version + 1,
         review_batch_version=state.review_batch_version + 1,
         d23_mode=False,
+        d24_mode=False,
         d23_adapter=profile.algorithms,
         d23_answer_revision=state.get("d23_answer_revision", 0) + 1,
         d23_conversations={},
@@ -678,7 +684,7 @@ with st.sidebar:
     )
 
     st.write(
-        "D2.4 — Dataset and Evidence: Not connected"
+        "D2.4 — Dataset and Evidence: available from D2.3"
     )
 
     st.write(
@@ -766,6 +772,7 @@ if (
     st.session_state.needs_next_question
     and not st.session_state.field_suggestions
     and not st.session_state.get("d23_mode", False)
+    and not st.session_state.get("d24_mode", False)
 ):
 
     process_next_question()
@@ -1034,9 +1041,17 @@ def render_d21_d22_chat():
 
 
 with chat_tab:
-    if st.session_state.get("d23_mode", False):
+    if st.session_state.get("d24_mode", False):
+        if st.button("Back to D2.3"):
+            st.session_state.d24_mode = False
+            st.rerun()
+        render_d24_chat()
+    elif st.session_state.get("d23_mode", False):
         if st.button("Back to D2.1 and D2.2"):
             st.session_state.d23_mode = False
+            st.rerun()
+        if st.button("Continue to D2.4"):
+            st.session_state.d24_mode = True
             st.rerun()
         render_d23_chat()
     else:

@@ -4,7 +4,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Literal
 
-from app.chatbot.d24_metadata import load_metadata
+from app.chatbot.d24_metadata import check_metadata_compatibility, load_metadata
 from app.deliverable_3.dataset_validation import validate_dataset_evidence
 
 
@@ -60,6 +60,13 @@ class D24AnswerAdapter:
 
     def get_answers(self, record_id):
         return deepcopy(self._record(record_id).answers)
+
+    def check_compatibility(self):
+        check_metadata_compatibility(self._metadata.fingerprint)
+
+    def field_ids(self, record_id):
+        """Return all known fields for the record, including inactive fields."""
+        return self._metadata.field_ids(self._record(record_id).kind)
 
     def active_fields(self, record_id):
         """Return the owner-visible field descriptions, including unanswered fields."""
