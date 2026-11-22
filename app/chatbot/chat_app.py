@@ -23,7 +23,8 @@ from app.chatbot.chat_llm import (
     handle_user_clarification,
 )
 
-from app.chatbot.d23_chat import render_d23_chat
+from app.chatbot.chat_navigation import render_section_footer
+from app.chatbot.d23_chat import d23_section_gaps, render_d23_chat, resume_d23
 from app.chatbot.d24_adapter import D24AnswerAdapter
 from app.chatbot.d24_chat import render_d24_chat
 from app.chatbot.d24_metadata import D24CompatibilityError
@@ -34,6 +35,8 @@ from app.chatbot.profile_io import (
     load_combined_profile,
 )
 from app.chatbot.questionnaire_bridge import CONDITIONAL_FIELDS, QuestionnaireBridge
+from app.deliverable_2.validation.run_ai_function import validate_ai_function
+from app.deliverable_3.product_validation import validate_profile
 
 
 # ============================================================
@@ -181,17 +184,7 @@ def ask_question(field_id, clarification=False):
         st.session_state.asked_question = None
         st.session_state.needs_next_question = False
 
-        if not st.session_state.questionnaire_complete:
-
-            add_message(
-                "assistant",
-                "All D2.1 and D2.2 questionnaire fields are complete, "
-                "including applicable conditional questions.\n\n"
-                "You can review your confirmed profile "
-                "or export it from the sidebar."
-            )
-
-            st.session_state.questionnaire_complete = True
+        st.session_state.questionnaire_complete = True
 
         return
 
@@ -510,6 +503,10 @@ def reset_application():
         "d24_adapter",
         "d24_revisions",
         "d24_conversations",
+        "d24_active_scope",
+        "ux_resume_algorithm",
+        "ux_resume_dataset",
+        "ux_review_widget_drafts",
     ]
 
     for key in keys:
@@ -577,6 +574,7 @@ def restore_profile(uploaded_file):
             "I'll continue with any remaining required questions."
         )},
     ]
+    st.session_state.get("ux_review_widget_drafts", {}).pop("D2.1/D2.2", None)
     return True, None
 
 
@@ -613,8 +611,13 @@ def apply_combined_profile(profile: CombinedProfile):
     )
     state.pop("d23_active_algorithm_id", None)
     state.pop("d23-algorithm-picker", None)
+    saved_drafts = state.get("ux_review_widget_drafts", {})
+    saved_drafts.pop("D2.1/D2.2", None)
+    saved_drafts.pop("D2.3", None)
     if profile.dataset_evidence is not None:
+        saved_drafts.pop("D2.4", None)
         state.update(d24_adapter=profile.dataset_evidence, d24_conversations={}, d24_revisions={})
+        state.pop("d24_active_scope", None)
         for key in list(state):
             if key.startswith("d24-"):
                 state.pop(key, None)
@@ -1079,25 +1082,84 @@ def render_d21_d22_chat():
         st.rerun()
 
 
+def d21_d22_gaps():
+    gaps = {}
+    for section, validator in (("D2.1", validate_profile), ("D2.2", validate_ai_function)):
+        for field_id in pending_fields(section):
+            gaps[field_id] = f"{section} · {bridge.get_field_label(field_id)}"
+        for issue in validator(bridge.get_questionnaire_answers(section)):
+            if issue["type"] in ("missing", "conditional"):
+                gaps.setdefault(issue["field_id"], f"{section} · {issue['issue']}")
+    return list(gaps.values())
+
+
+def resume_d21_d22():
+    if st.session_state.field_suggestions:
+        return False
+    st.session_state.intake_started = True
+    current = st.session_state.asked_field
+    if current and current in pending_fields(questionnaire_for_field(current)):
+        return
+    next_field = get_next_field()
+    if next_field:
+        ask_question(next_field)
+    else:
+        st.info("Review the validation gaps in the Manual Questionnaire Editor.")
+        return False
+
+
+def navigate_to(section):
+    state = st.session_state
+    current = "D2.4" if state.get("d24_mode") else "D2.3" if state.get("d23_mode") else "D2.1/D2.2"
+    prefix = {"D2.1/D2.2": "review_", "D2.3": "d23-review-", "D2.4": "d24-review-"}[current]
+    drafts = state.setdefault("ux_review_widget_drafts", {})
+    # Streamlit drops widget values when their section is hidden. Preserve inputs,
+    # never the confirmation buttons that act on them.
+    drafts[current] = {
+        key: state[key] for key in state
+        if key.startswith(prefix) and not key.endswith(("-confirm", "-reject", "-skip"))
+    }
+    state.update(drafts.pop(section, {}))
+    state.ux_navigation_revision = state.get("ux_navigation_revision", 0) + 1
+    state.d23_mode = section in ("D2.3", "D2.4")
+    state.d24_mode = section == "D2.4"
+    if section == "D2.1/D2.2":
+        # Returning to the transcript should not run carryover extraction.
+        state.needs_next_question = False
+    st.rerun()
+
+
 with chat_tab:
+    navigation_revision = st.session_state.get("ux_navigation_revision", 0)
     if st.session_state.get("d24_mode", False):
-        if st.button("Back to D2.3"):
-            st.session_state.d24_mode = False
-            st.rerun()
+        if st.button("Back to D2.3", key=f"section-back-d24-{navigation_revision}"):
+            navigate_to("D2.3")
         render_d24_chat()
     elif st.session_state.get("d23_mode", False):
-        if st.button("Back to D2.1 and D2.2"):
-            st.session_state.d23_mode = False
-            st.rerun()
-        if st.button("Continue to D2.4"):
-            st.session_state.d24_mode = True
-            st.rerun()
+        if st.button("Back to D2.1 and D2.2", key=f"section-back-d23-{navigation_revision}"):
+            navigate_to("D2.1/D2.2")
         render_d23_chat()
+        gaps, resume_record = d23_section_gaps()
+        revision = st.session_state.d23_answer_revision
+        active_id = st.session_state.get("d23_active_algorithm_id")
+        if render_section_footer(
+            "D2.3", gaps, next_section="D2.4", context=f"d23-{navigation_revision}-{active_id}-{revision}-{bool(gaps)}",
+            resume=lambda: resume_d23(resume_record),
+            resume_hint=f"Resume will open algorithm {resume_record}." if resume_record else "Add an algorithm to answer its questions.",
+        ):
+            navigate_to("D2.4")
     else:
-        if st.session_state.questionnaire_complete and st.button("Continue to D2.3"):
-            st.session_state.d23_mode = True
-            st.rerun()
         render_d21_d22_chat()
+        if st.session_state.intake_started or st.session_state.questionnaire_complete or bridge.answers:
+            gaps = d21_d22_gaps()
+            if render_section_footer(
+                "D2.1 and D2.2", gaps, next_section="D2.3",
+                context=(f"d21-d22-{navigation_revision}-{st.session_state.asked_field}-"
+                         f"{st.session_state.editor_version}-{bool(gaps)}"),
+                resume=resume_d21_d22,
+                resume_hint="Resolve pending suggestions first." if st.session_state.field_suggestions else None,
+            ):
+                navigate_to("D2.3")
 
 
 # ============================================================

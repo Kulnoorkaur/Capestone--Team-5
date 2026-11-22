@@ -2,6 +2,7 @@
 
 import streamlit as st
 
+from app.chatbot.chat_navigation import render_section_footer
 from app.chatbot.chat_llm import extract_d24_candidates
 from app.chatbot.d24_adapter import D24AnswerAdapter
 from app.chatbot.d24_metadata import D24CompatibilityError
@@ -24,6 +25,8 @@ def _select_record(adapter, kind):
     if not ids:
         st.caption(f"Add a {label.lower()} to begin.")
         return None
+    if picker_key not in st.session_state and adapter.selected_record_id in ids:
+        st.session_state[picker_key] = adapter.selected_record_id
 
     def label_for(record_id):
         name = adapter.get_answers(record_id).get(name_field)
@@ -170,7 +173,6 @@ def _render_record(adapter, record_id, scope):
         return
     field = active[field_id]
     with st.chat_message("assistant"):
-        st.write(f"**{field_id}**")
         st.write(field.prompt)
     key = f"d24-answer-{record_id}-{field_id}-{revision}"
     conversation = st.session_state.d24_conversations.setdefault(
@@ -188,6 +190,34 @@ def _render_record(adapter, record_id, scope):
             st.rerun()
     _render_extraction(adapter, record_id, scope, field_id, conversation)
     _render_suggestions(adapter, record_id, active, revision, conversation)
+
+
+def _required_findings(findings):
+    return [issue for issue in findings if issue["type"] in ("missing", "conditional")]
+
+
+def _resume_target(adapter, kind, record_id):
+    scopes = [*((scope, adapter.record_ids(scope)) for scope in _RECORDS), (adapter.GMLP, (adapter.GMLP,))]
+    targets = [(scope, identity) for scope, ids in scopes for identity in (ids or (None,))]
+    selected = (kind, record_id)
+    if selected in targets:
+        targets.remove(selected)
+        targets.insert(0, selected)
+    for scope, identity in targets:
+        if identity is None:
+            return scope, None, None
+        findings = _required_findings(adapter.validate_record(identity))
+        if findings:
+            fields = adapter.active_fields(identity)
+            answers = adapter.get_answers(identity)
+            field_id = next((
+                field for issue in findings for field in fields
+                if field not in answers and (
+                    field == issue["field_id"] or field.startswith((f"{issue['field_id']}.", f"{issue['field_id']}-"))
+                )
+            ), None)
+            return scope, identity, field_id
+    return kind, record_id, None
 
 
 def render_d24_chat():
@@ -208,7 +238,21 @@ def render_d24_chat():
     state.setdefault("d24_conversations", {})
     labels = {kind: label for kind, (label, _) in _RECORDS.items()}
     labels[adapter.GMLP] = "Profile-wide GMLP"
+    if "d24-section" not in state and state.get("d24_active_scope") in labels:
+        state["d24-section"] = state.d24_active_scope
+    resume = state.pop("ux_resume_dataset", None)
+    if resume:
+        scope, identity, field = resume
+        if identity is None or identity == adapter.GMLP or identity in adapter.record_ids(scope):
+            state["d24-section"] = scope
+            if identity is not None:
+                if scope != adapter.GMLP:
+                    state[f"d24-picker-{scope}"] = identity
+                if field in adapter.active_fields(identity):
+                    revision = state.d24_revisions.get(identity, 0)
+                    state[f"d24-question-{identity}-{revision}"] = field
     kind = st.radio("Dataset and evidence section", tuple(labels), format_func=labels.get, key="d24-section")
+    state.d24_active_scope = kind
     if kind == adapter.GMLP:
         record_id = adapter.GMLP
         adapter.select_record(record_id)
@@ -216,3 +260,14 @@ def render_d24_chat():
         record_id = _select_record(adapter, kind)
     if record_id is not None:
         _render_record(adapter, record_id, kind)
+    gaps = _required_findings(adapter.validate())
+    target = _resume_target(adapter, kind, record_id) if gaps else None
+    hint = None
+    if target:
+        scope, identity, _ = target
+        hint = f"Resume will open {labels[scope]}" + (f" ({identity})." if identity else " setup.")
+    render_section_footer(
+        "D2.4", [f"{issue['record']} · {issue['issue']}" for issue in gaps],
+        context=f"d24-{state.get('ux_navigation_revision', 0)}-{kind}-{record_id}-{state.d24_revisions.get(record_id, 0)}",
+        resume=lambda: state.update(ux_resume_dataset=target), resume_hint=hint,
+    )

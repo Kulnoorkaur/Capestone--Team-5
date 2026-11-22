@@ -23,6 +23,31 @@ def _complete(field_id, answer):
     )
 
 
+def d23_section_gaps():
+    adapter = st.session_state.d23_adapter
+    if not adapter.algorithm_ids:
+        return ["Describe at least one algorithm."], None
+    incomplete = []
+    gaps = []
+    for algorithm_id in adapter.algorithm_ids:
+        problems = adapter.build_record(algorithm_id)["validation_problems"]
+        if problems:
+            incomplete.append(algorithm_id)
+        name = _identity(adapter.get_algorithm(algorithm_id))
+        gaps.extend(f"{name} ({algorithm_id}) · {BY_ID[issue['id']]['label']} · {issue['problem']}"
+                    for issue in problems)
+    active_id = st.session_state.get("d23_active_algorithm_id")
+    return gaps, active_id if active_id in incomplete else next(iter(incomplete), None)
+
+
+def resume_d23(algorithm_id):
+    if algorithm_id is None:
+        return False
+    state = st.session_state
+    state["ux_resume_algorithm"] = algorithm_id
+    state.d23_answer_revision += 1
+
+
 def _answer_input(definition, current, key):
     field_type = definition["type"]
     options = definition["options"]
@@ -187,6 +212,13 @@ def render_d23_chat():
     if not adapter.algorithm_ids:
         return
 
+    resume = state.pop("ux_resume_algorithm", None)
+    if resume in adapter.algorithm_ids:
+        state["d23-algorithm-picker"] = resume
+        skipped = state.d23_conversations.get(resume, {}).get("skipped")
+        if skipped is not None:
+            skipped.difference_update(issue["id"] for issue in adapter.build_record(resume)["validation_problems"])
+
     if "d23-algorithm-picker" not in state:
         state["d23-algorithm-picker"] = state.get("d23_active_algorithm_id", adapter.algorithm_ids[0])
     algorithm_id = st.selectbox(
@@ -270,12 +302,10 @@ def render_d23_chat():
     with st.chat_message("assistant"):
         if field_id is None:
             if pending:
-                st.write("Review skipped questions to complete this algorithm's answers.")
-            else:
-                st.write(f"All applicable questions for {_identity(algorithm)} have been answered.")
+                st.write("You can revisit skipped questions in the answer review panel.")
             return
         definition = BY_ID[field_id]
-        st.write(f"**{field_id}** · {definition['label']}")
+        st.write(definition["label"])
         if definition["help"]:
             st.caption(definition["help"])
 

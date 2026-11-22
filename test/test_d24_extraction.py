@@ -158,8 +158,8 @@ class D24ExtractionWorkflowTests(unittest.TestCase):
         self.state = self.app.session_state
         self.state.questionnaire_complete = True
         self.app.run()
-        self.click("Continue to D2.3")
-        self.click("Continue to D2.4")
+        self.click("Continue with gaps")
+        self.click("Continue with gaps")
 
     @property
     def adapter(self):

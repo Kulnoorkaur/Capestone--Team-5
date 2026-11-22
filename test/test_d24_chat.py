@@ -25,8 +25,8 @@ class D24ChatTests(unittest.TestCase):
         self.assertNotIn("Continue to D2.4", [button.label for button in self.app.button])
         self.state.questionnaire_complete = True
         self.app.run()
-        self.click("Continue to D2.3")
-        self.click("Continue to D2.4")
+        self.click("Continue with gaps")
+        self.click("Continue with gaps")
 
     @property
     def adapter(self):
@@ -188,8 +188,8 @@ class D24ChatTests(unittest.TestCase):
         self.assertEqual(algorithms.get_algorithm(algorithm)["answers"]["ACC-001"]["value"], "Retained model v2")
         self.click("Back to D2.1 and D2.2")
         self.assertEqual(bridge.get_product_profile(), {"PIP-001": "Retained product", "AIF-019": "No"})
-        self.click("Continue to D2.3")
-        self.click("Continue to D2.4")
+        self.click("Continue with gaps")
+        self.click("Continue with gaps")
         self.assertEqual({record: self.adapter.get_answers(record) for record in records}, snapshot)
         for kind, remove, keep in (("function", second, first), ("document", second_doc, doc)):
             self.switch_section(kind)
@@ -224,8 +224,8 @@ class D24ChatTests(unittest.TestCase):
         self.click("Back to D2.1 and D2.2")
         self.assertIs(self.state.questionnaire_bridge, bridge)
         self.assertEqual(bridge.get_product_profile(), {"PIP-001": "Existing product", "AIF-019": "No"})
-        self.click("Continue to D2.3")
-        self.click("Continue to D2.4")
+        self.click("Continue with gaps")
+        self.click("Continue with gaps")
         self.assertIs(self.adapter, d24)
         self.assertEqual(d24.get_answers(dataset), {"DEP-001.dataset_name_version": "Persistent dataset"})
 
@@ -248,8 +248,8 @@ class D24ChatTests(unittest.TestCase):
             self.assertIn("Add algorithm", [button.label for button in self.app.button])
             self.click("Back to D2.1 and D2.2")
             self.assertTrue(self.app.chat_input)
-            self.click("Continue to D2.3")
-            self.click("Continue to D2.4")
+            self.click("Continue with gaps")
+            self.click("Continue with gaps")
             self.assertTrue(self.app.error)
         self.assertEqual(MANIFEST.read_bytes(), manifest)
         self.app.run()

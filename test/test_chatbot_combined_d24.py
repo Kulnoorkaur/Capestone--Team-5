@@ -167,8 +167,8 @@ class D24CombinedProfileStreamlitTests(unittest.TestCase):
         self.state.d23_adapter = old
         self.state.d23_answer_revision = 0
         self.app.run()
-        self.click("Continue to D2.3")
-        self.click("Continue to D2.4")
+        self.click("Continue with gaps")
+        self.click("Continue with gaps")
         self.click("Add dataset")
         self.old_d24 = self.state.d24_adapter
         self.old_id = self.old_d24.selected_record_id
