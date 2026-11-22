@@ -8,6 +8,12 @@ from unittest.mock import patch
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
+from app.chatbot import chat_llm
+from app.chatbot.d23_adapter import D23AnswerAdapter
+from app.chatbot.profile_io import dump_combined_profile
+from app.chatbot.questionnaire_bridge import QuestionnaireBridge
+from app.deliverable_2.questionnaires.algorithm_change_control import LOCKED, build_record
+
 
 ENTRY_POINT = Path(__file__).resolve().parents[1] / (
     "app/deliverable_2/integration/run_integrated_profile.py"
@@ -16,6 +22,10 @@ ENTRY_POINT = Path(__file__).resolve().parents[1] / (
 
 class D26ChatBuddyImportTests(unittest.TestCase):
     def setUp(self):
+        self.gemini = self.enterContext(patch.object(
+            chat_llm, "get_gemini_client", side_effect=AssertionError("Unexpected Gemini call")
+        ))
+        self.addCleanup(self.gemini.assert_not_called)
         self.app = AppTest.from_file(str(ENTRY_POINT), default_timeout=30).run()
         self.assert_no_app_errors()
 
@@ -30,8 +40,9 @@ class D26ChatBuddyImportTests(unittest.TestCase):
         self.assert_no_app_errors()
 
     def upload(self, profile):
+        raw = profile if isinstance(profile, str) else json.dumps(profile)
         self.app.file_uploader[0].set_value(
-            ("chat-buddy.json", json.dumps(profile).encode("utf-8"), "application/json")
+            ("chat-buddy.json", raw.encode("utf-8"), "application/json")
         ).run()
         self.assert_no_app_errors()
 
@@ -136,3 +147,104 @@ class D26ChatBuddyImportTests(unittest.TestCase):
         self.assert_results_cleared()
         self.assertFalse(self.button("Evaluate integrated profile").disabled)
         self.assertEqual(self.evaluate(), manual)
+
+    def test_combined_import_and_independent_algorithm_source(self):
+        def answer(value, details="", evidence=""):
+            return {"value": value, "details": details, "evidence": evidence}
+
+        self.app.text_input(key="d26-model-0-name").set_value("Manual model")
+        self.app.selectbox(key="d26-model-0-ACC-008").select(LOCKED)
+        self.app.text_input(key="d26-model-0-ACC-008-evidence").set_value("Design v1 §4")
+        self.app.selectbox(key="d26-model-0-ACC-013").select("Yes").run()
+        self.app.selectbox(key="d26-model-0-ACC-019").select("Yes").run()
+        self.app.text_area(key="d26-model-0-ACC-019-details").set_value("Change plan §1")
+        self.app.selectbox(key="d26-model-0-ACC-020-FDA").select("Under review").run()
+        manual = self.evaluate()
+        manual_results = copy.deepcopy(self.app.session_state["d26-results"])
+        manual_record = manual["algorithms"][0]
+
+        answers = {
+            "ACC-008": answer(LOCKED, evidence="Design v1 §4"),
+            "ACC-013": answer("Yes"),
+            "ACC-019": answer("Yes", "Change plan §1"),
+            "ACC-020": answer({"FDA": "Under review"}),
+        }
+        bridge = QuestionnaireBridge()
+        self.assertTrue(bridge.save_answer("PIP-001", "Imported product v1")[0])
+        self.assertTrue(bridge.save_answer("AIF-019", "No")[0])
+        adapter = D23AnswerAdapter()
+        first_id = adapter.add_algorithm("Same model", "1", algorithm_id="model-a")
+        second_id = adapter.add_algorithm("Same model", "2", algorithm_id="model-b")
+        for field_id, confirmed in answers.items():
+            adapter.save_answer(first_id, field_id, **confirmed)
+        adapter.save_answer(second_id, "ACC-005", "Yes")
+        adapter.save_answer(second_id, "ACC-001", "Second model", evidence="Model register §2")
+        exported = dump_combined_profile(bridge, adapter)
+        combined = json.loads(exported)
+        first, second = combined["algorithms"]
+        self.upload(exported)
+        self.assertIn("D2.3 Algorithm/change — 2 records", [item.label for item in self.app.expander])
+        self.assertTrue(any("Same model — 2 (model-b)" in item.value for item in self.app.text))
+        self.assertTrue(any("questionnaire validation gaps" in item.value for item in self.app.warning))
+        self.assertEqual(self.app.session_state["d26-profile"], manual)
+        self.assertEqual(self.app.session_state["d26-results"], manual_results)
+
+        self.click("Use this profile")
+        self.assert_results_cleared()
+        self.assertTrue(self.button("Evaluate integrated profile").disabled)
+        self.app.checkbox(key="d26-retained-inputs-ack").check().run()
+        imported = self.evaluate()
+        self.assertEqual(imported.keys(), manual.keys())
+        self.assertEqual(imported["schema_version"], "D2.6-V1")
+        self.assertEqual(self.app.session_state["d26-results"].keys(), manual_results.keys())
+        self.assertEqual(imported["product"], combined["product"])
+        self.assertEqual(imported["ai_function"], combined["ai_function"])
+        for section in ("dataset_evidence", "risk_documentation", "integration"):
+            self.assertEqual(imported[section], manual[section])
+        self.assertEqual([model["algorithm_id"] for model in imported["algorithms"]], ["model-a", "model-b"])
+        self.assertEqual([model["version"] for model in imported["algorithms"]], ["1", "2"])
+        model, partial = imported["algorithms"]
+        native = build_record("Same model — 1", answers)
+        self.assertEqual({key: model[key] for key in native}, native)
+        for key in ("validation_problems", "flags", "profile_status", "not_applicable"):
+            self.assertEqual(model[key], manual_record[key])
+        for field_id in ("ACC-008", "ACC-013", "ACC-019"):
+            self.assertEqual(model["answers"][field_id], manual_record["answers"][field_id])
+        self.assertEqual(model["answers"]["ACC-020"]["value"], {
+            fw: status for fw, status in manual_record["answers"]["ACC-020"]["value"].items() if status
+        })
+        self.assertEqual(partial["answers"]["ACC-008"], answer(None))
+        self.assertEqual(partial["answers"]["ACC-001"], answer("Second model", evidence="Model register §2"))
+        self.assertNotEqual(model["answers"]["ACC-001"], partial["answers"]["ACC-001"])
+        self.assertNotIn("ACC-020", partial["answers"])
+        self.assertTrue(any(issue["id"] == "ACC-005" for issue in partial["validation_problems"]))
+        self.assertTrue(any(
+            issue["issue_id"].startswith("D26-ACC-2-ACC-005")
+            for issue in self.app.session_state["d26-results"]["issue_log"]
+        ))
+
+        self.upload({**combined, "algorithms": [first, first]})
+        self.assertTrue(any("Duplicate algorithm ID" in issue.value for issue in self.app.error))
+        self.assertNotIn("Use this profile", [button.label for button in self.app.button])
+        self.assertEqual(self.app.session_state["d26-profile"], imported)
+        self.assertTrue(self.app.get("download_button"))
+
+        self.click("Use manual D2.3 records")
+        self.assert_results_cleared()
+        self.assertTrue(self.button("Evaluate integrated profile").disabled)
+        self.app.checkbox(key="d26-retained-inputs-ack").check().run()
+        self.assertEqual(self.evaluate(), {**imported, "algorithms": manual["algorithms"]})
+        self.click("Use imported D2.3 records")
+        self.assert_results_cleared()
+        self.assertTrue(self.button("Evaluate integrated profile").disabled)
+        self.upload({**combined, "algorithms": [second]})
+        self.click("Use this profile")
+        self.app.checkbox(key="d26-retained-inputs-ack").check().run()
+        self.assertEqual(self.evaluate()["algorithms"], [partial])
+        self.upload({"PIP-001": "Legacy product"})
+        self.click("Use this profile")
+        self.assert_results_cleared()
+        self.assertNotIn("Use imported D2.3 records", [button.label for button in self.app.button])
+        self.assertTrue(self.button("Evaluate integrated profile").disabled)
+        self.app.checkbox(key="d26-retained-inputs-ack").check().run()
+        self.assertEqual(self.evaluate()["algorithms"], manual["algorithms"])

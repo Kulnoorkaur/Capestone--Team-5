@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.chatbot.profile_io import ProfileImportError, load_confirmed_profile
+from app.chatbot.profile_io import ProfileImportError, load_combined_profile, load_confirmed_profile
 from app.chatbot.questionnaire_bridge import QUESTIONNAIRE_FIELDS
 from app.deliverable_2.questionnaires.product_profile import render_product_profile, FIELD_LABELS as PIP_LABELS
 from app.deliverable_2.questionnaires.ai_function import render_ai_function, FIELD_LABELS as AIF_LABELS
@@ -500,10 +500,41 @@ def render_algorithm_answers():
     return models
 
 
-def select_answer_source(use_import):
-    st.session_state["d26-use-chatbot-profile"] = use_import
+def clear_assessment():
     for key in ("d26-profile", "d26-results", "d26-retained-inputs-ack"):
         st.session_state.pop(key, None)
+
+
+def select_answer_source(use_import):
+    st.session_state["d26-use-chatbot-profile"] = use_import
+    st.session_state["d26-use-chatbot-algorithms"] = (
+        use_import and "algorithms" in st.session_state["d26-chatbot-profile"]
+    )
+    clear_assessment()
+
+
+def load_chatbot_import(raw):
+    try:
+        envelope = json.loads(raw)
+    except (ValueError, RecursionError):
+        return load_confirmed_profile(raw)  # Use the shared loader's diagnostic.
+    if not isinstance(envelope, dict) or not {"schema", "version", "algorithms"} & envelope.keys():
+        return load_confirmed_profile(raw)
+
+    profile = load_combined_profile(raw)
+    algorithms = []
+    for algorithm_id in profile.algorithms.algorithm_ids:
+        identity = profile.algorithms.get_algorithm(algorithm_id)
+        record = profile.algorithms.build_record(algorithm_id)
+        algorithms.append({
+            **record, "algorithm_id": algorithm_id,
+            "name": identity["name"], "version": identity["version"],
+        })
+    return {
+        "product": profile.bridge.get_questionnaire_answers("D2.1"),
+        "ai_function": profile.bridge.get_questionnaire_answers("D2.2"),
+        "algorithms": algorithms,
+    }
 
 
 def render_import_preview(profile):
@@ -529,6 +560,19 @@ def render_import_preview(profile):
                 st.dataframe(issues, hide_index=True, use_container_width=True)
             else:
                 st.caption("No findings from the questionnaire validator.")
+    if "algorithms" in profile:
+        with st.expander(f"D2.3 Algorithm/change — {len(profile['algorithms'])} records", expanded=True):
+            if not profile["algorithms"]:
+                st.warning("This file has no algorithm records. You can select manual D2.3 records after accepting it.")
+            for record in profile["algorithms"]:
+                st.text(f"{record['record_name']} ({record['algorithm_id']})")
+                if record["validation_problems"]:
+                    st.warning("This algorithm record has questionnaire validation gaps.")
+                    st.dataframe(record["validation_problems"], hide_index=True)
+                if record["flags"]:
+                    st.dataframe(record["flags"], hide_index=True)
+                if not record["validation_problems"] and not record["flags"]:
+                    st.caption("No D2.3 validation gaps or flags.")
 
 
 def render_chatbot_import():
@@ -536,13 +580,14 @@ def render_chatbot_import():
     uploaded = st.file_uploader("Upload a Chat Buddy confirmed profile (JSON)", type=["json"])
     if uploaded is not None:
         try:
-            preview = load_confirmed_profile(uploaded.getvalue())
+            preview = load_chatbot_import(uploaded.getvalue())
         except ProfileImportError as error:
             st.error(str(error))
         else:
             render_import_preview(preview)
+            retained = "D2.4–D2.5" if "algorithms" in preview else "D2.3–D2.5"
             st.info(
-                "Existing D2.3–D2.5 and integration inputs will be retained. "
+                f"Existing {retained} and integration inputs will be retained for assessment. "
                 "They must describe the same product and version as this profile."
             )
             if st.button("Use this profile"):
@@ -560,6 +605,18 @@ def render_chatbot_import():
         st.caption("Evaluation uses the accepted Chat Buddy profile for D2.1 and D2.2. Manual drafts are kept.")
         product_identity = accepted["product"].get("PIP-001", "Not provided")
         st.text(f"Accepted product and version: {product_identity}")
+        if "algorithms" in accepted:
+            use_algorithms = st.session_state["d26-use-chatbot-algorithms"]
+            label = "Use manual D2.3 records" if use_algorithms else "Use imported D2.3 records"
+            if st.button(label):
+                use_algorithms = not use_algorithms
+                st.session_state["d26-use-chatbot-algorithms"] = use_algorithms
+                clear_assessment()
+                st.rerun()
+            if use_algorithms:
+                st.caption(f"Evaluation uses {len(accepted['algorithms'])} imported D2.3 records.")
+            else:
+                st.caption("Evaluation uses manual D2.3 records.")
         return accepted
     st.caption("Evaluation uses manual D2.1 and D2.2 answers.")
     return None
@@ -587,7 +644,14 @@ with pages[0]:
 with pages[1]:
     ai_function = render_ai_function()
 with pages[2]:
+    use_imported_algorithms = (
+        imported_profile is not None and st.session_state.get("d26-use-chatbot-algorithms", False)
+    )
+    if use_imported_algorithms:
+        st.info("Evaluation uses the imported D2.3 records. The controls below retain your manual drafts.")
     algorithms = render_algorithm_answers()
+    if use_imported_algorithms:
+        algorithms = imported_profile["algorithms"]
 with pages[3]:
     datasets = render_dataset_evidence()
 with pages[4]:
@@ -616,8 +680,9 @@ with pages[6]:
              "are routed to manual regulatory review; no automatic legal classification is issued.")
     can_evaluate = True
     if imported_profile is not None:
+        retained = "D2.4–D2.5" if use_imported_algorithms else "D2.3–D2.5"
         st.warning(
-            "D2.3–D2.5 and integration inputs are retained from this session. "
+            f"{retained} and integration inputs are retained from this session. "
             "Check that they apply to the imported product and version before evaluating."
         )
         can_evaluate = st.checkbox(
