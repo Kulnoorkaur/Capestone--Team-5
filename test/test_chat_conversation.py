@@ -7,7 +7,7 @@ from streamlit.testing.v1 import AppTest
 
 from app.chatbot import chat_llm
 from app.chatbot.chat_navigation import propose_record_identity
-from app.deliverable_2.questionnaires.algorithm_change_control import LOCKED
+from app.deliverable_2.questionnaires.algorithm_change_control import BY_ID, LOCKED
 
 
 CHAT_APP = Path(__file__).resolve().parents[1] / "app/chatbot/chat_app.py"
@@ -15,6 +15,17 @@ RETINAGUARD = (
     "Our algorithm is called RetinaGuard DR Detection Algorithm, version 1.0. "
     "It uses a convolutional neural network to analyze retinal fundus photographs and detect signs of diabetic retinopathy. "
     "The algorithm generates a risk score that ophthalmologists review to support clinical decision-making."
+)
+
+FUNCTION_DESCRIPTION = (
+    "The RetinaGuard DR Detection Algorithm implements the diabetic retinopathy detection and screening function described in D2.2. "
+    "It analyzes retinal fundus photographs using a convolutional neural network (CNN) and generates a risk score to support ophthalmologists in clinical decision-making."
+)
+COMPONENT_DESCRIPTION = (
+    "Yes. The RetinaGuard DR Detection Algorithm uses open-source software components, including TensorFlow and Keras, "
+    "to develop and train its convolutional neural network (CNN). These libraries support model development and training, "
+    "while the algorithm itself was developed in-house. No third-party pre-trained models are incorporated. "
+    "The specific library versions have not yet been confirmed."
 )
 
 
@@ -56,6 +67,8 @@ class GuidedConversationTests(unittest.TestCase):
     def click(self, label):
         self.button(label).click().run()
         self.assertFalse(self.app.exception)
+        if label == "Continue with gaps":
+            self.click("Confirm continue with gaps")
 
     def submit(self, key, text):
         self.app.chat_input(key=key).set_value(text).run()
@@ -75,6 +88,81 @@ class GuidedConversationTests(unittest.TestCase):
 
         self.enterContext(patch.object(chat_llm, "_request_extraction", side_effect=respond))
         return calls
+
+    def test_confirmed_d22_context_and_reference_feedback(self):
+        evidence = "Analyzes retinal fundus photographs to detect diabetic retinopathy."
+        self.assertTrue(self.state.questionnaire_bridge.save_answer("AIF-004", evidence)[0])
+        proposed = {}
+        calls = self.mock_proposals("D2.3", proposed)
+        self.submit("ux_d23_proposal-message", RETINAGUARD)
+        self.click("Confirm algorithm record")
+        adapter = self.state.d23_adapter
+        record = adapter.algorithm_ids[0]
+        key = f"d23-chat-input-{record}"
+        proposed["ACC-002"] = {"value": "Retinal screening", "quote": FUNCTION_DESCRIPTION}
+        self.submit(key, FUNCTION_DESCRIPTION)
+        self.assertTrue(any("couldn't identify a supported answer" in node.value for node in self.app.markdown))
+        self.assertTrue(any("Which confirmed D2.2 entries" in node.value for node in self.app.markdown))
+        self.assertFalse(any(node.value == "Which AI function(s) from Deliverable 2.2 does this algorithm implement?"
+                             for node in self.app.markdown))
+        proposed["ACC-002"].update(value="AIF-006", reference_evidence={"AIF-006": evidence})
+        self.submit(key, FUNCTION_DESCRIPTION)
+        self.assertNotIn("ACC-002", self.state.d23_conversations[record]["candidates"])
+        proposed["ACC-002"].update(value="AIF-004", reference_evidence={"AIF-004": evidence})
+        self.submit(key, FUNCTION_DESCRIPTION)
+        self.assertEqual(calls[-1]["confirmed_d22_answers"], {"AIF-004": evidence})
+        self.assertEqual(calls[-1]["user_message"], FUNCTION_DESCRIPTION)
+        self.assertNotIn("ACC-002", adapter.get_algorithm(record)["answers"])
+        self.assertTrue(any("Review the extracted information" in node.value for node in self.app.info))
+        self.click("Confirm suggestion")
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-002"]["value"], "AIF-004")
+        self.assertEqual(self.state.d23_conversations[record]["turns"][-1], FUNCTION_DESCRIPTION)
+        self.assertFalse(any(node.label == "Confirm suggestion" for node in self.app.button))
+        self.assertTrue(any("learning approach" in node.value.lower() for node in self.app.markdown))
+
+    def test_component_details_use_original_message_and_keep_evidence_blank(self):
+        proposed = {}
+        calls = self.mock_proposals("D2.3", proposed)
+        self.submit("ux_d23_proposal-message", RETINAGUARD)
+        self.click("Confirm algorithm record")
+        adapter = self.state.d23_adapter
+        record = adapter.algorithm_ids[0]
+        adapter.save_answer(record, "ACC-002", "AIF-004")
+        adapter.save_answer(record, "ACC-003", [BY_ID["ACC-003"]["options"][0]])
+        adapter.save_answer(record, "ACC-004", ["CNN"])
+        self.app.run()
+        source_id = "2"
+        proposed["ACC-005"] = {"value": "Yes", "quote": "Yes", "details": "Uses an invented version."}
+        self.submit(f"d23-chat-input-{record}", "Yes. We might use an open-source library in the future.")
+        key = f"d23-review-{record}-{source_id}-ACC-005"
+        self.assertEqual(self.app.text_area(key=f"{key}-details").value, "")
+        self.assertTrue(any("couldn't verify an explanation" in node.value for node in self.app.caption))
+        self.click("Confirm suggestion")
+        self.assertTrue(any("Enter the component explanation" in node.value for node in self.app.error))
+        self.assertNotIn("ACC-005", adapter.get_algorithm(record)["answers"])
+        self.click("Reject suggestion")
+        proposed["ACC-005"].pop("details")
+        self.submit(f"d23-chat-input-{record}", COMPONENT_DESCRIPTION)
+        key = f"d23-review-{record}-3-ACC-005"
+        self.assertEqual(self.app.text_area(key=f"{key}-details").value, COMPONENT_DESCRIPTION[5:])
+        self.assertEqual(self.app.text_input(key=f"{key}-evidence").value, "")
+        self.assertNotIn("ACC-005", adapter.get_algorithm(record)["answers"])
+        self.click("Confirm suggestion")
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-005"], {
+            "value": "Yes", "details": COMPONENT_DESCRIPTION[5:], "evidence": "",
+        })
+        self.assertEqual(len(calls), 3)
+
+    def test_gemini_error_retains_turn_and_offers_focused_followup(self):
+        self.submit("ux_d23_proposal-message", RETINAGUARD)
+        self.click("Confirm algorithm record")
+        record = self.state.d23_active_algorithm_id
+        self.d23_extractor.side_effect = RuntimeError("Unavailable")
+        self.submit(f"d23-chat-input-{record}", FUNCTION_DESCRIPTION)
+        self.app.run()
+        self.assertTrue(any("Your message is retained" in node.value for node in self.app.markdown))
+        self.assertTrue(any("Which confirmed D2.2 entries" in node.value for node in self.app.markdown))
+        self.assertEqual(self.state.d23_conversations[record]["turns"].count(FUNCTION_DESCRIPTION), 1)
 
     def test_exact_retinaguard_description_becomes_a_single_review_turn(self):
         proposed = {

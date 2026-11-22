@@ -29,6 +29,8 @@ class ChatNavigationTests(unittest.TestCase):
     def click(self, label):
         self.button(label).click().run()
         self.assertFalse(self.app.exception)
+        if label == "Continue with gaps":
+            self.click("Confirm continue with gaps")
 
     def assert_footer(self, phrase, button_label, after):
         nodes = list(self.app._tree)
@@ -83,7 +85,14 @@ class ChatNavigationTests(unittest.TestCase):
         self.click("Continue to D2.3")
         self.assertTrue(any("What is its name and version?" in item.value for item in self.app.markdown))
         self.assert_footer("D2.3 has unresolved", "Continue with gaps", self.button("Add algorithm"))
-        self.click("Continue with gaps")
+        gaps = next(item for item in self.app.expander if item.label == "Review remaining gaps")
+        self.assertFalse(gaps.proto.expanded)
+        self.button("Continue with gaps").click().run()
+        self.assertFalse(self.app.exception)
+        self.assertTrue(self.state.d23_mode)
+        gaps = next(item for item in self.app.expander if item.label == "Review remaining gaps")
+        self.assertTrue(gaps.proto.expanded)
+        self.click("Confirm continue with gaps")
         self.assertTrue(any("Add a dataset to begin" in item.value for item in self.app.caption))
 
     def test_algorithm_completion_is_section_wide_and_stale_navigation_is_ignored(self):

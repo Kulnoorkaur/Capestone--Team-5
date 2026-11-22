@@ -7,23 +7,32 @@ import streamlit as st
 
 def render_section_footer(section, gaps, *, context, next_section=None, resume=None, resume_hint=None):
     """Render the current status and return whether the user chose to advance."""
+    state = st.session_state
+    reviewing_gaps = state.get("ux_review_gaps_context") == context
     with st.container():
         if gaps:
             with st.chat_message("assistant"):
                 st.write(f"{section} has unresolved questions or requirements.")
-                for gap in gaps[:3]:
+            with st.expander("Review remaining gaps", expanded=reviewing_gaps):
+                for gap in gaps:
                     st.write(f"- {gap}")
-                if len(gaps) > 3:
-                    st.caption(f"{len(gaps) - 3} more gaps remain.")
-            if next_section and st.button(
-                "Continue with gaps", key=f"section-next-{context}",
-                help=f"Continue to {next_section} and keep this section incomplete.",
-            ):
-                return True
+            if next_section:
+                if reviewing_gaps and st.button(
+                    "Confirm continue with gaps", key=f"section-confirm-next-{context}",
+                ):
+                    state.pop("ux_review_gaps_context", None)
+                    return True
+                if not reviewing_gaps and st.button(
+                    "Continue with gaps", key=f"section-next-{context}",
+                    help=f"Review the remaining gaps before continuing to {next_section}.",
+                ):
+                    state.ux_review_gaps_context = context
+                    st.rerun()
             if resume:
                 if resume_hint:
                     st.caption(resume_hint)
                 if st.button("Resume unanswered questions", key=f"section-resume-{context}"):
+                    state.pop("ux_review_gaps_context", None)
                     if resume() is not False:
                         st.rerun()
         else:

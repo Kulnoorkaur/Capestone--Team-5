@@ -483,12 +483,69 @@ def _d23_has_direct_basis(field_id, value, quote):
     return True
 
 
+def _d23_reference_supported(value, quote, evidence, d22_answers):
+    if not isinstance(value, str):
+        return False
+    references = set(re.findall(r"\bAIF-\d{3}(?:-[A-Z]+)?\b", value))
+    if references and all(re.search(rf"\b{reference}(?![-\w])", quote) for reference in references):
+        return True
+    if not references or not isinstance(evidence, dict) or not re.fullmatch(
+        r"AIF-\d{3}(?:-[A-Z]+)?(?:\s*(?:[,;]|\band\b)\s*AIF-\d{3}(?:-[A-Z]+)?)*", value.strip()
+    ):
+        return False
+
+    def terms(text):
+        return set(re.findall(r"[a-z]{4,}", text.casefold())) - {
+            "algorithm", "confirmed", "describes", "described", "function", "implements",
+            "model", "product", "software", "support", "supports", "this", "uses", "using",
+            "with", "from", "that", "these", "which",
+        }
+
+    for reference in references:
+        answer = d22_answers.get(reference)
+        excerpts = answer if isinstance(answer, list) else [answer]
+        snippet = evidence.get(reference)
+        if not any(isinstance(item, str) and _quoted_in(snippet, item) for item in excerpts):
+            return False
+        if len(terms(snippet) & terms(quote)) < 2:
+            return False
+    return True
+
+
+def _d23_explanation(details, source):
+    excerpts = details if isinstance(details, list) else [details]
+    if excerpts and all(_quoted_in(excerpt, source) for excerpt in excerpts):
+        return " ".join(dict.fromkeys(excerpts))
+    return ""
+
+
+def _d23_component_explanation(source):
+    """Recover an explicit component description if the extractor omitted details."""
+    sentences = re.split(r"(?<=[.!?])\s+", source.strip())
+    for index, sentence in enumerate(sentences):
+        if re.search(
+            r"\b(?:uses?|includes?|incorporates?)\s+(?:[\w-]+\s+){0,3}"
+            r"(?:open[- ]source|third[- ]party|pre[- ]trained)\b[^.!?]*"
+            r"\b(?:including|such as|called)\s+\w", sentence, re.I,
+        ) and not re.search(r"\b(?:not|no|might|may|could|would|plan(?:s|ned)?|if)\b", sentence, re.I):
+            details = [sentence]
+            for following in sentences[index + 1:]:
+                if not re.match(
+                    r"^(?:These (?:libraries|components|tools)\b|No third[- ]party\b|"
+                    r"The (?:specific )?(?:library|component|dependency) versions?\b)", following, re.I,
+                ):
+                    break
+                details.append(following)
+            return " ".join(details)
+    return ""
+
+
 def extract_d23_candidates(
     message, *, algorithm_id, algorithm, source_id, active_fields,
-    target_field=None, other_algorithm_names=(),
+    target_field=None, other_algorithm_names=(), d22_answers=None,
 ):
     """Extract quoted candidates for a single algorithm. Do not save answers."""
-    from app.deliverable_2.questionnaires.algorithm_change_control import FIELDS, FRAMEWORKS
+    from app.deliverable_2.questionnaires.algorithm_change_control import FIELDS, FRAMEWORKS, needs_details
 
     correction = bool(_EXPLICIT_CORRECTION.match(message))
     confirmed = algorithm["answers"]
@@ -500,6 +557,7 @@ def extract_d23_candidates(
         for field in FIELDS
         if correction or field["id"] not in confirmed
     }
+    d22_answers = (d22_answers or {}) if "ACC-002" in fields else {}
     payload = {
         "algorithm_id": algorithm_id,
         "algorithm_name": algorithm["name"],
@@ -510,6 +568,7 @@ def extract_d23_candidates(
         "target_field": target_field,
         "fields": fields,
         "frameworks": FRAMEWORKS,
+        "confirmed_d22_answers": d22_answers,
         "confirmed_values": {key: answer["value"] for key, answer in confirmed.items()},
         "explicit_correction": correction,
     }
@@ -541,7 +600,19 @@ Return only a JSON object with algorithm_id and source_id copied from the input,
 an optional clarification string, and candidates keyed by field ID. Each
 candidate must have value and a non-empty exact quote from user_message that
 supports the entire value. Optional details must be copied verbatim from that
-same quote. Do not return product-document evidence.
+user_message. The details can be an array of exact excerpts that explain the
+proposed answer, including sentences outside its short value quote. Include an
+explanation wherever the user provides one, especially for Yes or Unknown when
+the question asks why or requests specifics. For ACC-005, capture supported
+component names, roles, development context, exclusions and version uncertainty.
+Do not turn uncertainty into a known version or return product-document evidence.
+
+For ACC-002, return the AIF references named explicitly in user_message or link
+a concrete capability described there to matching confirmed_d22_answers. For
+inferred references, return only the IDs as a comma-separated string and include
+reference_evidence mapping each ID to an exact excerpt of its confirmed D2.2
+answer showing the match. Omit ACC-002 and ask which reference applies if the
+link is uncertain. A general mention of D2.2 does not identify a reference.
 
 {json.dumps(payload, ensure_ascii=False)}
 """
@@ -585,11 +656,20 @@ same quote. Do not return product-document evidence.
                 continue
         if not _d23_has_direct_basis(field_id, value, quote):
             continue
-        details = proposed.get("details", "")
+        if field_id == "ACC-002" and not _d23_reference_supported(
+            value, quote, proposed.get("reference_evidence"), d22_answers,
+        ):
+            continue
+        # Keep optional in-quote details as before. For required explanations,
+        # other excerpts from this turn are eligible when it describes one algorithm.
+        source = message if not other_mentions and needs_details(field_id, value) else quote
+        details = _d23_explanation(proposed.get("details", ""), source)
+        if field_id == "ACC-005" and value == "Yes" and not details:
+            details = _d23_component_explanation(source)
         suggestions[field_id] = {
             "algorithm_id": algorithm_id, "field_id": field_id, "source_id": source_id,
             "quote": quote, "value": value,
-            "details": details if _quoted_in(details, quote) else "",
+            "details": details,
             "correction": correction,
         }
     clarification = result.get("clarification", "")

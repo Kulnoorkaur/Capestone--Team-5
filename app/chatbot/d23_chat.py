@@ -106,26 +106,31 @@ def _submit_turn(adapter, conversation, algorithm_id, field_id, message, *, init
     ]
     conversation["turns"].append(message)
     source_id = str(len(conversation["turns"]))
+    conversation["notice_target"] = None if initial else field_id
+    bridge = st.session_state.get("questionnaire_bridge")
     try:
         suggestions, clarification = extract_d23_candidates(
             message, algorithm_id=algorithm_id, algorithm=algorithm, source_id=source_id,
             active_fields=active, target_field=field_id,
             other_algorithm_names=other_names,
+            d22_answers=bridge.get_questionnaire_answers("D2.2") if bridge else {},
         )
     except Exception:
         conversation["notice"] = "Gemini could not process that answer. Your message is retained. You can answer using the controls below."
         return
     for field, candidate in suggestions.items():
         rejected = conversation["rejected"].get(field, ())
+        details = _evidence_key(candidate["details"])
         if any(
             _evidence_key(message) == prior_message
-            or (not candidate["correction"] and _evidence_key(candidate["quote"]) == prior_quote)
+            or (not candidate["correction"] and _evidence_key(candidate["quote"]) == prior_quote
+                and (not details or details in prior_message))
             for prior_message, prior_quote in rejected
         ):
             continue
         conversation["candidates"][field] = candidate
     conversation["notice"] = clarification or (
-        "" if suggestions or initial else "I couldn't identify a supported answer. Could you clarify the detail for this algorithm?"
+        "" if suggestions or initial else "I couldn't identify a supported answer in that message."
     )
 
 
@@ -140,6 +145,8 @@ def _active_suggestions(adapter, algorithm_id, active, conversation):
             adapter.check_answer(algorithm_id, field_id, candidate["value"], details=candidate["details"])
         except ValueError:
             candidates.pop(field_id)
+            if not conversation["notice"]:
+                conversation["notice"] = "A proposed answer did not meet the questionnaire requirements."
         else:
             suggestions[field_id] = candidate
     return suggestions
@@ -180,6 +187,7 @@ def _same_value(left, right):
 
 def _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggestions):
     st.subheader("Review extracted D2.3 answers")
+    st.info("Review the extracted information. You can edit or reject each suggestion. Confirm only answers that are accurate.")
     for field_id, candidate in suggestions.items():
         definition = BY_ID[field_id]
         key = f"d23-review-{algorithm_id}-{candidate['source_id']}-{field_id}"
@@ -188,10 +196,14 @@ def _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggesti
             st.text(f"Source turn {candidate['source_id']}: {candidate['quote']}")
             value = _answer_input(definition, candidate["value"], key)
             details, evidence = _answer_metadata(field_id, value, key, details=candidate["details"])
+            if needs_details(field_id, value) and not details.strip():
+                st.caption("I couldn't verify an explanation. Enter the details you can confirm, or skip this suggestion for now.")
             confirm, reject, skip = st.columns(3)
             if confirm.button("Confirm suggestion", key=f"{key}-confirm"):
                 quote = candidate["quote"] if _same_value(value, candidate["value"]) else ""
                 try:
+                    if field_id == "ACC-005" and needs_details(field_id, value) and not details.strip():
+                        raise ValueError("Enter the component explanation before confirming, or skip this suggestion for now.")
                     _save_answer(adapter, algorithm_id, field_id, value, details, evidence, conversation, quote)
                 except ValueError as error:
                     st.error(str(error))
@@ -403,14 +415,23 @@ def render_d23_chat():
         for message in ([introduction] if introduction else []) + conversation["turns"]:
             with st.chat_message("user"):
                 st.text(message)
-        if conversation["notice"]:
+        same_target = target is not None and conversation.get("notice_target") == target
+        notice = conversation["notice"] if same_target or conversation.get("notice_target") is None else ""
+        if notice:
             with st.chat_message("assistant"):
-                st.write(conversation["notice"])
+                st.write(notice)
         if suggestions:
             _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggestions)
         elif target:
             with st.chat_message("assistant"):
-                st.write(conversational_question(BY_ID[target]["label"]))
+                if same_target and target == "ACC-002":
+                    st.write("Which confirmed D2.2 entries describe what this algorithm implements? "
+                             "Include their AIF references if you know them, or describe the matching capability more specifically.")
+                elif same_target:
+                    st.write(f"To continue, please clarify this detail for the selected algorithm. "
+                             f"{conversational_question(BY_ID[target]['label'])}")
+                else:
+                    st.write(conversational_question(BY_ID[target]["label"]))
             _question_actions(adapter, algorithm_id, target, conversation)
         elif adapter.build_record(algorithm_id)["validation_problems"]:
             with st.chat_message("assistant"):

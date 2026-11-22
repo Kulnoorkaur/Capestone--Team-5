@@ -91,6 +91,7 @@ def _submit_record_turn(adapter, record_id, scope, target, conversation, message
     source_id = str(len(turns) + 1)
     previous = tuple(turns[-6:])
     turns.append(message)
+    conversation["notice_target"] = None if initial else target
     conversation["pending"] = {}
     labels = {}
     for kind, (_, name_field) in _RECORDS.items():
@@ -121,6 +122,7 @@ def _submit_record_turn(adapter, record_id, scope, target, conversation, message
 
 def _render_suggestions(adapter, record_id, active, revision, conversation):
     _reconcile_suggestions(adapter, record_id, conversation)
+    st.info("Review the extracted information. You can edit or reject each suggestion. Confirm only answers that are accurate.")
     for field_id, candidate in conversation["pending"].items():
         if field_id not in active:
             continue
@@ -228,16 +230,21 @@ def _render_record(adapter, record_id, scope, tools):
     for message in ([introduction] if introduction else []) + conversation["turns"]:
         with st.chat_message("user"):
             st.text(message)
-    if conversation["notice"]:
+    same_target = target is not None and conversation.get("notice_target") == target
+    if conversation["notice"] and (same_target or conversation.get("notice_target") is None):
         with st.chat_message("assistant"):
             st.info(conversation["notice"])
     _reconcile_suggestions(adapter, record_id, conversation)
-    reviewing = bool(conversation["pending"])
+    reviewing = any(field_id in active for field_id in conversation["pending"])
     if reviewing:
         _render_suggestions(adapter, record_id, active, revision, conversation)
     elif target:
         with st.chat_message("assistant"):
-            st.write(conversational_question(active[target].prompt))
+            question = conversational_question(active[target].prompt)
+            if same_target:
+                st.write(f"To continue, please clarify this detail for the selected record. {question}")
+            else:
+                st.write(question)
         _question_actions(adapter, record_id, target, active[target], conversation, revision)
     elif required:
         with st.chat_message("assistant"):

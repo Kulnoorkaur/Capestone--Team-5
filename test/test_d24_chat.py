@@ -38,6 +38,8 @@ class D24ChatTests(unittest.TestCase):
     def click(self, label):
         next(button for button in self.app.button if button.label == label).click().run()
         self.assert_no_errors()
+        if label == "Continue with gaps":
+            self.click("Confirm continue with gaps")
 
     def widget_key(self, record, field):
         revision = self.state.d24_revisions.get(record, 0)

@@ -168,6 +168,8 @@ class D24ExtractionWorkflowTests(unittest.TestCase):
     def click(self, label):
         next(button for button in self.app.button if button.label == label).click().run()
         self.assertFalse(self.app.exception)
+        if label == "Continue with gaps":
+            self.click("Confirm continue with gaps")
 
     def add(self, label):
         self.click(label)
