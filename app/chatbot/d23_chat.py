@@ -1,5 +1,7 @@
 """Algorithm-scoped conversation and confirmation for D2.3."""
 
+import re
+
 import streamlit as st
 
 from app.chatbot.chat_navigation import (
@@ -97,7 +99,7 @@ def _algorithm_conversation(conversations, algorithm_id):
     })
 
 
-def _submit_turn(adapter, conversation, algorithm_id, field_id, message, *, initial=False):
+def _submit_turn(adapter, conversation, algorithm_id, field_id, message, *, initial=False, question=None):
     algorithm = adapter.get_algorithm(algorithm_id)
     active = adapter.active_field_ids(algorithm_id)
     other_names = [
@@ -106,16 +108,26 @@ def _submit_turn(adapter, conversation, algorithm_id, field_id, message, *, init
     ]
     conversation["turns"].append(message)
     source_id = str(len(conversation["turns"]))
+    if question:
+        conversation.setdefault("questions", {})[source_id] = question
     conversation["notice_target"] = None if initial else field_id
+    conversation["request_failed"] = False
     bridge = st.session_state.get("questionnaire_bridge")
+    d22_answers = bridge.get_questionnaire_answers("D2.2") if bridge else {}
+    pending = conversation["candidates"].get(field_id)
+    followup = pending if pending and _missing_details(field_id, pending) else None
     try:
         suggestions, clarification = extract_d23_candidates(
             message, algorithm_id=algorithm_id, algorithm=algorithm, source_id=source_id,
             active_fields=active, target_field=field_id,
             other_algorithm_names=other_names,
-            d22_answers=bridge.get_questionnaire_answers("D2.2") if bridge else {},
+            d22_answers=d22_answers,
+            d22_labels={key: bridge.get_field_label(key) for key in d22_answers},
+            detail_followup=followup,
+            original_reply=conversation["turns"][int(followup["source_id"]) - 1] if followup else None,
         )
     except Exception:
+        conversation["request_failed"] = True
         conversation["notice"] = "Gemini could not process that answer. Your message is retained. You can answer using the controls below."
         return
     for field, candidate in suggestions.items():
@@ -167,7 +179,8 @@ def _save_answer(adapter, algorithm_id, field_id, value, details, evidence, conv
 
 
 def _dismiss_candidate(conversation, field_id, candidate, *, skip=False):
-    message = conversation["turns"][int(candidate["source_id"]) - 1]
+    source_id = candidate.get("detail_source_id", candidate["source_id"])
+    message = conversation["turns"][int(source_id) - 1]
     conversation["rejected"].setdefault(field_id, set()).add(
         (_evidence_key(message), _evidence_key(candidate["quote"]))
     )
@@ -185,25 +198,69 @@ def _same_value(left, right):
     return left == right
 
 
-def _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggestions):
+def _missing_details(field_id, candidate):
+    return needs_details(field_id, candidate["value"]) and (
+        not candidate["details"].strip() or bool(candidate.get("missing_detail"))
+    )
+
+
+def _detail_question(field_id, candidate):
+    if candidate.get("missing_detail"):
+        return candidate["missing_detail"]
+    value = candidate["value"]
+    label = BY_ID[field_id]["label"]
+    detail = re.search(rf"\(if {re.escape(str(value))}: ([^()]*)\)", label, re.I)
+    if detail:
+        return f"What can you share about the {detail[1]}?"
+    if value == "Unknown" or isinstance(value, list) and "Unknown" in value:
+        return "What is still unknown, and why?"
+    return "What details support this answer?"
+
+
+def _render_reference_context(value):
+    bridge = st.session_state.get("questionnaire_bridge")
+    answers = bridge.get_questionnaire_answers("D2.2") if bridge else {}
+    for field in dict.fromkeys(re.findall(r"\bAIF-\d{3}(?:-[A-Z]+)?\b", value)):
+        if field in answers:
+            answer = answers[field]
+            description = ", ".join(answer) if isinstance(answer, list) else answer
+            st.caption(f"{field} · {bridge.get_field_label(field)}")
+            st.text(description)
+        else:
+            st.caption(f"{field} · No confirmed D2.2 answer for this reference.")
+
+
+def _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggestions, detail_target):
     st.subheader("Review extracted D2.3 answers")
     st.info("Review the extracted information. You can edit or reject each suggestion. Confirm only answers that are accurate.")
     for field_id, candidate in suggestions.items():
         definition = BY_ID[field_id]
-        key = f"d23-review-{algorithm_id}-{candidate['source_id']}-{field_id}"
+        review_source = candidate.get("detail_source_id", candidate["source_id"])
+        key = f"d23-review-{algorithm_id}-{review_source}-{field_id}"
         with st.expander(conversational_question(definition["label"]), expanded=True):
             st.text(_identity(algorithm))
             st.text(f"Source turn {candidate['source_id']}: {candidate['quote']}")
             value = _answer_input(definition, candidate["value"], key)
+            if field_id == "ACC-002":
+                _render_reference_context(value)
+            if "detail_source_id" in candidate:
+                st.caption(f"Explanation supplied in follow-up turn {candidate['detail_source_id']}.")
             details, evidence = _answer_metadata(field_id, value, key, details=candidate["details"])
-            if needs_details(field_id, value) and not details.strip():
-                st.caption("I couldn't verify an explanation. Enter the details you can confirm, or skip this suggestion for now.")
+            if field_id == detail_target:
+                if not details.strip():
+                    st.caption("I couldn't verify an explanation. Add it in chat or edit it here.")
+                else:
+                    st.caption("You can add the missing detail in chat or edit the explanation here.")
+                st.write(_detail_question(field_id, candidate))
+            elif needs_details(field_id, value) and not details.strip():
+                st.caption("Add an explanation before confirming.")
             confirm, reject, skip = st.columns(3)
             if confirm.button("Confirm suggestion", key=f"{key}-confirm"):
                 quote = candidate["quote"] if _same_value(value, candidate["value"]) else ""
                 try:
-                    if field_id == "ACC-005" and needs_details(field_id, value) and not details.strip():
-                        raise ValueError("Enter the component explanation before confirming, or skip this suggestion for now.")
+                    if needs_details(field_id, value) and not details.strip():
+                        subject = "the component explanation" if field_id == "ACC-005" else "an explanation"
+                        raise ValueError(f"Enter {subject} before confirming, or skip this suggestion for now.")
                     _save_answer(adapter, algorithm_id, field_id, value, details, evidence, conversation, quote)
                 except ValueError as error:
                     st.error(str(error))
@@ -412,26 +469,42 @@ def render_d23_chat():
             state.ux_d23_add = True
             st.rerun()
         introduction = state.get("ux_d23_introductions", {}).get(algorithm_id)
-        for message in ([introduction] if introduction else []) + conversation["turns"]:
+        if introduction:
+            with st.chat_message("user"):
+                st.text(introduction)
+        questions = conversation.get("questions", {})
+        for number, message in enumerate(conversation["turns"], 1):
+            if question := questions.get(str(number)):
+                with st.chat_message("assistant"):
+                    st.text(question)
             with st.chat_message("user"):
                 st.text(message)
-        same_target = target is not None and conversation.get("notice_target") == target
+        detail_target = next((field for field, candidate in suggestions.items()
+                              if _missing_details(field, candidate)), None)
+        current = detail_target or target
+        same_target = current is not None and conversation.get("notice_target") == current
         notice = conversation["notice"] if same_target or conversation.get("notice_target") is None else ""
-        if notice:
+        if notice and (not detail_target or conversation.get("request_failed")):
             with st.chat_message("assistant"):
                 st.write(notice)
+        question = None
         if suggestions:
-            _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggestions)
+            _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggestions, detail_target)
+            if detail_target:
+                question = _detail_question(detail_target, suggestions[detail_target])
         elif target:
-            with st.chat_message("assistant"):
-                if same_target and target == "ACC-002":
-                    st.write("Which confirmed D2.2 entries describe what this algorithm implements? "
-                             "Include their AIF references if you know them, or describe the matching capability more specifically.")
-                elif same_target:
-                    st.write(f"To continue, please clarify this detail for the selected algorithm. "
-                             f"{conversational_question(BY_ID[target]['label'])}")
+            question = conversational_question(BY_ID[target]["label"])
+            if same_target and target == "ACC-002":
+                question = ("Which confirmed D2.2 entries describe what this algorithm implements? "
+                            "Include their AIF references if you know them, or describe the matching capability more specifically.")
+            elif same_target:
+                options = BY_ID[target]["options"]
+                if BY_ID[target]["type"] == "select" and 1 < len(options) <= 4:
+                    question = f"Which answer fits best: {', '.join(options)}? You can add context in your own words."
                 else:
-                    st.write(conversational_question(BY_ID[target]["label"]))
+                    question = "You can clarify your answer in chat, edit it manually, or skip for now."
+            with st.chat_message("assistant"):
+                st.write(question)
             _question_actions(adapter, algorithm_id, target, conversation)
         elif adapter.build_record(algorithm_id)["validation_problems"]:
             with st.chat_message("assistant"):
@@ -441,10 +514,10 @@ def render_d23_chat():
                 st.write(f"Required answers for {_identity(algorithm)} are complete. You can add another algorithm or return to an existing one.")
         message = st.chat_input(
             "Describe this algorithm or answer in your own words",
-            key=f"d23-chat-input-{algorithm_id}", disabled=bool(suggestions),
+            key=f"d23-chat-input-{algorithm_id}", disabled=bool(suggestions) and detail_target is None,
         )
-        if message and message.strip() and not suggestions:
-            _submit_turn(adapter, conversation, algorithm_id, target, message)
+        if message and message.strip() and (not suggestions or detail_target):
+            _submit_turn(adapter, conversation, algorithm_id, current, message, question=question)
             st.rerun()
     with tools:
         _manual_algorithm_answers(adapter, algorithm_id, algorithm, conversation, active, pending, target)

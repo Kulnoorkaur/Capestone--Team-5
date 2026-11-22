@@ -111,6 +111,8 @@ class GuidedConversationTests(unittest.TestCase):
         proposed["ACC-002"].update(value="AIF-004", reference_evidence={"AIF-004": evidence})
         self.submit(key, FUNCTION_DESCRIPTION)
         self.assertEqual(calls[-1]["confirmed_d22_answers"], {"AIF-004": evidence})
+        self.assertTrue(any(node.value.startswith("AIF-004 ·") for node in self.app.caption))
+        self.assertTrue(any(node.value == evidence for node in self.app.text))
         self.assertEqual(calls[-1]["user_message"], FUNCTION_DESCRIPTION)
         self.assertNotIn("ACC-002", adapter.get_algorithm(record)["answers"])
         self.assertTrue(any("Review the extracted information" in node.value for node in self.app.info))
@@ -119,6 +121,108 @@ class GuidedConversationTests(unittest.TestCase):
         self.assertEqual(self.state.d23_conversations[record]["turns"][-1], FUNCTION_DESCRIPTION)
         self.assertFalse(any(node.label == "Confirm suggestion" for node in self.app.button))
         self.assertTrue(any("learning approach" in node.value.lower() for node in self.app.markdown))
+
+    def start_algorithm_at(self, target):
+        self.submit("ux_d23_proposal-message", RETINAGUARD)
+        self.click("Confirm algorithm record")
+        adapter = self.state.d23_adapter
+        record = adapter.algorithm_ids[0]
+        for field in adapter.active_field_ids(record):
+            if field == target:
+                break
+            if field in adapter.get_algorithm(record)["answers"]:
+                continue
+            definition = BY_ID[field]
+            options = definition["options"]
+            value = options[0] if options else "AIF-004"
+            if definition["type"] == "multiselect":
+                value = [value]
+            adapter.save_answer(record, field, value, details="Confirmed example")
+        self.app.run()
+        return adapter, record
+
+    def test_reproducibility_keeps_optional_explanation_with_yes(self):
+        explanation = ("The algorithm uses fixed parameters during inference and is expected to produce "
+                       "consistent risk scores when processing identical images under identical operating conditions.")
+        proposed = {}
+        self.mock_proposals("D2.3", proposed)
+        adapter, record = self.start_algorithm_at("ACC-006")
+        proposed["ACC-006"] = {"value": "Yes", "quote": "Yes", "details": explanation}
+        self.submit(f"d23-chat-input-{record}", f"Yes. {explanation}")
+        key = f"d23-review-{record}-2-ACC-006"
+        self.assertEqual(self.app.text_area(key=f"{key}-details").value, explanation)
+        self.assertNotIn("ACC-006", adapter.get_algorithm(record)["answers"])
+        self.click("Confirm suggestion")
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-006"]["details"], explanation)
+        self.assertTrue(any("changeable after release" in node.value for node in self.app.markdown))
+
+    def test_retraining_reply_survives_empty_extractor_output(self):
+        explanation = (
+            "Clinician corrections, site data, and clinical outcomes are collected and securely stored. "
+            "The data undergo privacy review, quality checks, and clinical validation before approved use in retraining. "
+            "Updated models require validation and manufacturer approval before release."
+        )
+        self.mock_proposals("D2.3", {})
+        adapter, record = self.start_algorithm_at("ACC-012")
+        self.submit(f"d23-chat-input-{record}", f"Yes. {explanation}")
+        key = f"d23-review-{record}-2-ACC-012"
+        self.assertEqual(self.app.selectbox(key=key).value, "Yes")
+        self.assertEqual(self.app.text_area(key=f"{key}-details").value, explanation)
+        self.assertNotIn("ACC-012", adapter.get_algorithm(record)["answers"])
+        self.click("Confirm suggestion")
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-012"]["details"], explanation)
+        self.assertTrue(any("planned or anticipated" in node.value for node in self.app.markdown))
+
+    def test_followup_preserves_pending_no_and_advances_after_confirmation(self):
+        proposed = {}
+        calls = self.mock_proposals("D2.3", proposed)
+        adapter, record = self.start_algorithm_at("ACC-006")
+        self.submit(f"d23-chat-input-{record}", "No.")
+        self.assertTrue(any("source of variability" in node.value for node in self.app.markdown))
+        self.assertNotIn("ACC-006", adapter.get_algorithm(record)["answers"])
+        self.assertFalse(self.app.chat_input(key=f"d23-chat-input-{record}").disabled)
+        detail = "Randomized preprocessing changes the score for otherwise identical inputs."
+        proposed["ACC-006"] = {"value": "No", "quote": detail, "details": detail}
+        self.submit(f"d23-chat-input-{record}", detail)
+        self.assertEqual(calls[-1]["pending_answer_followup"]["quote"], "No")
+        self.assertEqual(calls[-1]["user_message"], detail)
+        suggestion = self.state.d23_conversations[record]["candidates"]["ACC-006"]
+        self.assertEqual((suggestion["quote"], suggestion["source_id"], suggestion["detail_source_id"]),
+                         ("No", "2", "3"))
+        self.assertEqual(self.app.text_area(key=f"d23-review-{record}-3-ACC-006-details").value, detail)
+        self.assertNotIn("ACC-006", adapter.get_algorithm(record)["answers"])
+        self.click("Confirm suggestion")
+        answer = adapter.get_algorithm(record)["answers"]["ACC-006"]
+        self.assertEqual((answer["value"], answer["details"], answer["evidence"]), ("No", detail, ""))
+        self.assertTrue(any("changeable after release" in node.value for node in self.app.markdown))
+        self.assertEqual(len(calls), 3)
+
+    def test_partial_retraining_explanation_combines_with_focused_followup(self):
+        proposed = {}
+        calls = self.mock_proposals("D2.3", proposed)
+        adapter, record = self.start_algorithm_at("ACC-012")
+        data_path = "Clinician corrections are stored in a restricted retraining queue."
+        screening = "A clinical reviewer screens each correction before approval."
+        question = "Who screens the corrections before retraining?"
+        proposed["ACC-012"] = {
+            "value": "Yes", "quote": "Yes", "details": data_path, "missing_detail": question,
+        }
+        key = f"d23-chat-input-{record}"
+        self.submit(key, f"Yes. {data_path}")
+        self.assertTrue(any(node.value == question for node in self.app.markdown))
+        self.assertEqual(self.app.text_area(key=f"d23-review-{record}-2-ACC-012-details").value, data_path)
+        proposed["ACC-012"] = {"value": "Yes", "quote": screening, "details": screening}
+        self.submit(key, screening)
+        self.assertEqual(calls[-1]["pending_answer_followup"]["details"], data_path)
+        self.assertEqual(calls[-1]["original_reply"], f"Yes. {data_path}")
+        self.assertEqual(self.app.text_area(key=f"d23-review-{record}-3-ACC-012-details").value,
+                         f"{data_path} {screening}")
+        self.assertTrue(any(node.value == question for node in self.app.text))
+        self.assertFalse(any(node.value == question for node in self.app.markdown))
+        self.assertNotIn("ACC-012", adapter.get_algorithm(record)["answers"])
+        self.click("Confirm suggestion")
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-012"]["details"],
+                         f"{data_path} {screening}")
 
     def test_component_details_use_original_message_and_keep_evidence_blank(self):
         proposed = {}

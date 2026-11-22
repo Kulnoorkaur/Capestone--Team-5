@@ -515,34 +515,27 @@ def _d23_reference_supported(value, quote, evidence, d22_answers):
 def _d23_explanation(details, source):
     excerpts = details if isinstance(details, list) else [details]
     if excerpts and all(_quoted_in(excerpt, source) for excerpt in excerpts):
-        return " ".join(dict.fromkeys(excerpts))
+        explanation = " ".join(dict.fromkeys(excerpts))
+        if explanation.strip(" .!?").casefold() not in {"yes", "no", "unknown"}:
+            return explanation
     return ""
 
 
-def _d23_component_explanation(source):
-    """Recover an explicit component description if the extractor omitted details."""
-    sentences = re.split(r"(?<=[.!?])\s+", source.strip())
-    for index, sentence in enumerate(sentences):
-        if re.search(
-            r"\b(?:uses?|includes?|incorporates?)\s+(?:[\w-]+\s+){0,3}"
-            r"(?:open[- ]source|third[- ]party|pre[- ]trained)\b[^.!?]*"
-            r"\b(?:including|such as|called)\s+\w", sentence, re.I,
-        ) and not re.search(r"\b(?:not|no|might|may|could|would|plan(?:s|ned)?|if)\b", sentence, re.I):
-            details = [sentence]
-            for following in sentences[index + 1:]:
-                if not re.match(
-                    r"^(?:These (?:libraries|components|tools)\b|No third[- ]party\b|"
-                    r"The (?:specific )?(?:library|component|dependency) versions?\b)", following, re.I,
-                ):
-                    break
-                details.append(following)
-            return " ".join(details)
-    return ""
+def _d23_direct_reply(message, options):
+    """Recognize an explicit binary reply to the question on screen."""
+    match = re.match(r"^\s*(Yes|No)(?:\s*[,.:;!—]\s*|\s*$)", message, re.I)
+    if not match or match[1].title() not in options or "?" in message:
+        return None
+    details = message[match.end():].strip()
+    if re.match(r"^(?:maybe|possibly|not sure|(?:I|we|it|they)\s+(?:might|may|could|plan to))\b", details, re.I):
+        details = ""
+    return match[1].title(), match[1], details
 
 
 def extract_d23_candidates(
     message, *, algorithm_id, algorithm, source_id, active_fields,
-    target_field=None, other_algorithm_names=(), d22_answers=None,
+    target_field=None, other_algorithm_names=(), d22_answers=None, d22_labels=None,
+    detail_followup=None, original_reply=None,
 ):
     """Extract quoted candidates for a single algorithm. Do not save answers."""
     from app.deliverable_2.questionnaires.algorithm_change_control import FIELDS, FRAMEWORKS, needs_details
@@ -553,9 +546,11 @@ def extract_d23_candidates(
         field["id"]: {
             "question": field["label"], "type": field["type"], "options": field["options"],
             "when": field["when"], "active": field["id"] in active_fields,
+            "details_required_for": field["detail_on"],
         }
         for field in FIELDS
-        if correction or field["id"] not in confirmed
+        if (correction or field["id"] not in confirmed)
+        and (not detail_followup or field["id"] == target_field)
     }
     d22_answers = (d22_answers or {}) if "ACC-002" in fields else {}
     payload = {
@@ -569,6 +564,9 @@ def extract_d23_candidates(
         "fields": fields,
         "frameworks": FRAMEWORKS,
         "confirmed_d22_answers": d22_answers,
+        "confirmed_d22_labels": {key: label for key, label in (d22_labels or {}).items() if key in d22_answers},
+        "pending_answer_followup": detail_followup,
+        "original_reply": original_reply,
         "confirmed_values": {key: answer["value"] for key, answer in confirmed.items()},
         "explicit_correction": correction,
     }
@@ -603,9 +601,18 @@ supports the entire value. Optional details must be copied verbatim from that
 user_message. The details can be an array of exact excerpts that explain the
 proposed answer, including sentences outside its short value quote. Include an
 explanation wherever the user provides one, especially for Yes or Unknown when
-the question asks why or requests specifics. For ACC-005, capture supported
-component names, roles, development context, exclusions and version uncertainty.
-Do not turn uncertainty into a known version or return product-document evidence.
+the question asks why or requests specifics. A supplied explanation is useful
+even when optional. A direct Yes or No can be extracted even when its details
+are missing. If a required detail is absent, retain the supported value and
+include a short missing_detail question on that candidate about the specific
+questionnaire detail still missing. Ask this only if the owner question asks
+for that detail. For a pending_answer_followup, return optional followup_details
+as exact excerpts from the NEW user_message that supplement the pending value.
+Use original_reply to understand what the follow-up refers to. Include an
+optional remaining_detail if the requested detail is still incomplete.
+Keep the pending value unless the user clearly corrects it. Do not treat the old quote as a
+quote from the new message. Do not turn uncertainty into certainty or return
+product-document evidence.
 
 For ACC-002, return the AIF references named explicitly in user_message or link
 a concrete capability described there to matching confirmed_d22_answers. For
@@ -632,6 +639,11 @@ link is uncertain. A general mention of D2.2 does not identify a reference.
         name for name in other_algorithm_names
         if name.strip().casefold() != algorithm["name"].strip().casefold() and mentions_name(message, name)
     ]
+    target = fields.get(target_field, {})
+    direct = None
+    if not other_mentions and not detail_followup and target.get("active"):
+        direct = _d23_direct_reply(message, target.get("options", ()))
+
     for field_id, proposed in candidates.items():
         if field_id not in fields or not isinstance(proposed, dict) or "value" not in proposed:
             continue
@@ -660,18 +672,39 @@ link is uncertain. A general mention of D2.2 does not identify a reference.
             value, quote, proposed.get("reference_evidence"), d22_answers,
         ):
             continue
-        # Keep optional in-quote details as before. For required explanations,
-        # other excerpts from this turn are eligible when it describes one algorithm.
-        source = message if not other_mentions and needs_details(field_id, value) else quote
+        source = quote if other_mentions else message
         details = _d23_explanation(proposed.get("details", ""), source)
-        if field_id == "ACC-005" and value == "Yes" and not details:
-            details = _d23_component_explanation(source)
+        if not details and field_id == target_field and direct and value == direct[0]:
+            details = direct[2]
         suggestions[field_id] = {
             "algorithm_id": algorithm_id, "field_id": field_id, "source_id": source_id,
             "quote": quote, "value": value,
             "details": details,
             "correction": correction,
         }
+        missing_detail = proposed.get("missing_detail")
+        if needs_details(field_id, value) and isinstance(missing_detail, str) and missing_detail.strip():
+            suggestions[field_id]["missing_detail"] = missing_detail.strip()[:300]
+    if direct and target_field not in suggestions and not result.get("clarification"):
+        value, quote, details = direct
+        if _d23_has_direct_basis(target_field, value, quote):
+            suggestions[target_field] = {
+                "algorithm_id": algorithm_id, "field_id": target_field, "source_id": source_id,
+                "quote": quote, "value": value, "details": details, "correction": correction,
+            }
+    if detail_followup and not correction and not other_mentions:
+        details = _d23_explanation(result.get("followup_details", ""), message)
+        proposed = suggestions.pop(target_field, None)
+        if not details and proposed and proposed["value"] == detail_followup["value"]:
+            details = proposed["details"]
+        if details and "?" not in message and details not in detail_followup["details"]:
+            updated = {key: value for key, value in detail_followup.items() if key != "missing_detail"}
+            updated["details"] = " ".join(filter(None, (detail_followup["details"], details)))
+            updated["detail_source_id"] = source_id
+            remaining = result.get("remaining_detail")
+            if isinstance(remaining, str) and remaining.strip():
+                updated["missing_detail"] = remaining.strip()[:300]
+            suggestions[target_field] = updated
     clarification = result.get("clarification", "")
     return suggestions, clarification.strip() if isinstance(clarification, str) else ""
 
