@@ -368,7 +368,8 @@ class D23ChatTests(unittest.TestCase):
         adapter = self.app.session_state.d23_adapter
         locked = "We use a locked convolutional neural network."
         plan = "We retrain it offline every six months using additional images to maintain performance."
-        prefix = self.send_turn(f"{locked} {plan}", {
+        context = " The team keeps a detailed record of each release and provides it during review." * 18
+        prefix = self.send_turn(f"{locked} {plan}{context}", {
             "ACC-004": {"value": ["CNN"], "quote": locked},
             "ACC-008": {"value": LOCKED, "quote": locked},
             "ACC-013": {"value": "Yes", "quote": plan},

@@ -505,8 +505,17 @@ def reset_application():
         "d24_conversations",
         "d24_active_scope",
         "ux_resume_algorithm",
+        "ux_select_algorithm",
         "ux_resume_dataset",
         "ux_review_widget_drafts",
+        "ux_d23_add",
+        "ux_d23_proposal",
+        "ux_d23_introductions",
+        "ux_d24_add",
+        "ux_d24_proposal_dataset",
+        "ux_d24_proposal_function",
+        "ux_d24_proposal_document",
+        "ux_d24_introductions",
     ]
 
     for key in keys:
@@ -611,6 +620,8 @@ def apply_combined_profile(profile: CombinedProfile):
     )
     state.pop("d23_active_algorithm_id", None)
     state.pop("d23-algorithm-picker", None)
+    for key in ("ux_d23_add", "ux_d23_proposal", "ux_d23_introductions", "ux_resume_algorithm", "ux_select_algorithm"):
+        state.pop(key, None)
     saved_drafts = state.get("ux_review_widget_drafts", {})
     saved_drafts.pop("D2.1/D2.2", None)
     saved_drafts.pop("D2.3", None)
@@ -618,6 +629,9 @@ def apply_combined_profile(profile: CombinedProfile):
         saved_drafts.pop("D2.4", None)
         state.update(d24_adapter=profile.dataset_evidence, d24_conversations={}, d24_revisions={})
         state.pop("d24_active_scope", None)
+        for key in ("ux_d24_add", "ux_d24_proposal_dataset", "ux_d24_proposal_function",
+                    "ux_d24_proposal_document", "ux_d24_introductions", "ux_resume_dataset"):
+            state.pop(key, None)
         for key in list(state):
             if key.startswith("d24-"):
                 state.pop(key, None)

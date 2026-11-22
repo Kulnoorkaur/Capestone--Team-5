@@ -189,7 +189,10 @@ class D24ExtractionWorkflowTests(unittest.TestCase):
 
     def test_dataset_multi_field_confirm_edit_reject_and_conditional_staging(self):
         record = self.add("Add dataset")
-        message = "The role is Other: calibration. Collection was Mixed."
+        message = (
+            "The role is Other: calibration. Collection was Mixed."
+            + " The team documents the development process and makes records available for review." * 18
+        )
         self.submit(record, message, {
             "DEP-001.role_other": proposal("calibration", "Other: calibration"),
             "DEP-001.role": proposal(["Other"], "The role is Other: calibration", explanation="The user named the role."),

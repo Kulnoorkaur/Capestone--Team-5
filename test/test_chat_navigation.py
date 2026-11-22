@@ -81,7 +81,7 @@ class ChatNavigationTests(unittest.TestCase):
         self.app.run()
         self.assertEqual(sum("D2.1 and D2.2 complete" in item.value for item in self.app.markdown), 1)
         self.click("Continue to D2.3")
-        self.assertTrue(any("Which algorithm are you describing?" in item.value for item in self.app.markdown))
+        self.assertTrue(any("What is its name and version?" in item.value for item in self.app.markdown))
         self.assert_footer("D2.3 has unresolved", "Continue with gaps", self.button("Add algorithm"))
         self.click("Continue with gaps")
         self.assertTrue(any("Add a dataset to begin" in item.value for item in self.app.caption))
