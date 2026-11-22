@@ -1,0 +1,15 @@
+{
+  "schema": "chat-buddy-d24-owner-contract",
+  "version": 1,
+  "source_sha256": "e8997819ba307e1eef8aebae431551730ebe83730ae496dedb37d29f640534b3",
+  "sections": {
+    "dataset": "datasets",
+    "function": "ai_function_versions",
+    "document": "evidence_documents"
+  },
+  "local_answer_paths": {
+    "dataset": {
+      "annotation_used": "DEP-012-trigger"
+    }
+  }
+}
