@@ -41,11 +41,20 @@ class D24AnswerAdapter:
     def record_ids(self, kind: RecordKind):
         return tuple(record_id for record_id, record in self._records.items() if record.kind == kind)
 
-    def create_record(self, kind: RecordKind):
+    def create_record(self, kind: RecordKind, *, record_id=None):
         if kind not in self._metadata.sections:
             raise ValueError(f"Unknown record kind: {kind}.")
-        record_id = f"{kind}-{self._next_id}"
-        self._next_id += 1
+        if record_id is None:
+            record_id = f"{kind}-{self._next_id}"
+            self._next_id += 1
+        elif not isinstance(record_id, str) or not record_id.strip() or record_id == self.GMLP:
+            raise ValueError("Expected a non-empty, non-reserved record ID.")
+        elif record_id in self._records:
+            raise ValueError(f"Duplicate D2.4 record ID: {record_id}.")
+        else:
+            prefix, _, number = record_id.rpartition("-")
+            if prefix in self._metadata.sections and number.isascii() and number.isdecimal():
+                self._next_id = max(self._next_id, int(number) + 1)
         self._records[record_id] = _Record(kind, {})
         return record_id
 
@@ -62,7 +71,11 @@ class D24AnswerAdapter:
         return deepcopy(self._record(record_id).answers)
 
     def check_compatibility(self):
-        check_metadata_compatibility(self._metadata.fingerprint)
+        check_metadata_compatibility(self.questionnaire_fingerprint)
+
+    @property
+    def questionnaire_fingerprint(self):
+        return self._metadata.fingerprint
 
     def field_ids(self, record_id):
         """Return all known fields for the record, including inactive fields."""

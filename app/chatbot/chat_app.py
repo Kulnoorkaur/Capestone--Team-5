@@ -24,7 +24,9 @@ from app.chatbot.chat_llm import (
 )
 
 from app.chatbot.d23_chat import render_d23_chat
+from app.chatbot.d24_adapter import D24AnswerAdapter
 from app.chatbot.d24_chat import render_d24_chat
+from app.chatbot.d24_metadata import D24CompatibilityError
 from app.chatbot.profile_io import (
     CombinedProfile,
     ProfileImportError,
@@ -581,6 +583,8 @@ def restore_profile(uploaded_file):
 def apply_combined_profile(profile: CombinedProfile):
     """Replace confirmed stores only after the entire upload has validated."""
     state = st.session_state
+    restored_sections = "D2.1–D2.3" if profile.dataset_evidence is None else "D2.1–D2.4"
+    keep_d24_open = profile.dataset_evidence is None and state.get("d24_mode", False)
     state.update(
         questionnaire_bridge=profile.bridge,
         field_suggestions={},
@@ -595,27 +599,47 @@ def apply_combined_profile(profile: CombinedProfile):
         active_questionnaire="D2.1",
         editor_version=state.editor_version + 1,
         review_batch_version=state.review_batch_version + 1,
-        d23_mode=False,
-        d24_mode=False,
+        d23_mode=keep_d24_open,
+        d24_mode=keep_d24_open,
         d23_adapter=profile.algorithms,
         d23_answer_revision=state.get("d23_answer_revision", 0) + 1,
         d23_conversations={},
         unified_messages=[
             {"role": "assistant", "content": WELCOME},
             {"role": "assistant", "content": (
-                "Restored confirmed D2.1–D2.3 answers. I'll continue with any remaining questions."
+                f"Restored confirmed {restored_sections} answers. I'll continue with any remaining questions."
             )},
         ],
     )
     state.pop("d23_active_algorithm_id", None)
     state.pop("d23-algorithm-picker", None)
+    if profile.dataset_evidence is not None:
+        state.update(d24_adapter=profile.dataset_evidence, d24_conversations={}, d24_revisions={})
+        for key in list(state):
+            if key.startswith("d24-"):
+                state.pop(key, None)
 
 
 def render_combined_profile_io():
-    with st.expander("Combined D2.1–D2.3 profile"):
+    with st.expander("Combined Chat Buddy profile"):
+        algorithms = st.session_state.get("d23_adapter")
+        try:
+            datasets = st.session_state.get("d24_adapter")
+            if datasets is None:
+                datasets = D24AnswerAdapter()
+            backup = dump_combined_profile(bridge, algorithms, dataset_evidence=datasets)
+        except D24CompatibilityError as error:
+            st.warning(f"Version 2 download is unavailable. {error}")
+        else:
+            st.download_button(
+                "Download combined D2.1–D2.4 JSON",
+                data=backup,
+                file_name="chat_buddy_confirmed_profile_v2.json",
+                mime="application/json",
+            )
         st.download_button(
             "Download combined D2.1–D2.3 JSON",
-            data=dump_combined_profile(bridge, st.session_state.get("d23_adapter")),
+            data=dump_combined_profile(bridge, algorithms),
             file_name="chat_buddy_confirmed_profile_v1.json",
             mime="application/json",
         )
@@ -625,7 +649,7 @@ def render_combined_profile_io():
         if uploaded is None:
             return
         try:
-            profile = load_combined_profile(uploaded.getvalue())
+            profile = load_combined_profile(uploaded.getvalue(), allow_d24=True)
         except ProfileImportError as error:
             st.error(str(error))
             return
@@ -642,10 +666,24 @@ def render_combined_profile_io():
             st.text(f"{record['record_name']} ({algorithm_id})")
             st.json(snapshot["answers"], expanded=False)
             st.caption(f"Validation findings: {len(record['validation_problems'])}. Flags: {len(record['flags'])}.")
-        st.warning(
-            "Restoring this file replaces your confirmed D2.1–D2.3 answers and clears "
-            "pending suggestions and conversation history. Chat quotes are outside this backup."
-        )
+        if profile.dataset_evidence is None:
+            st.warning(
+                "This version 1 backup contains D2.1–D2.3 only. Restoring it will replace those sections "
+                "and preserve your current D2.4 answers."
+            )
+        else:
+            dataset_evidence = profile.dataset_evidence
+            st.caption(
+                f"D2.4 — {len(dataset_evidence.record_ids('dataset'))} datasets, "
+                f"{len(dataset_evidence.record_ids('function'))} evaluations, "
+                f"{len(dataset_evidence.record_ids('document'))} documents"
+            )
+            st.caption(f"D2.4 validation findings: {len(dataset_evidence.validate())}.")
+            st.warning(
+                "Version 2 replaces your confirmed D2.1–D2.4 answers and clears "
+                "pending suggestions, drafts, and conversation history for those sections."
+            )
+        st.caption("Backups preserve confirmed answers and document references. Chat quotations and history are session-only.")
         if st.button("Restore combined profile"):
             apply_combined_profile(profile)
             st.rerun()

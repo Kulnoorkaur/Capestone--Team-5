@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import json
 
 from app.chatbot.d23_adapter import D23AnswerAdapter, FIELDS_BY_ID
+from app.chatbot.d24_adapter import D24AnswerAdapter
+from app.chatbot.d24_metadata import D24CompatibilityError
 from app.chatbot.questionnaire_bridge import (
     CONDITIONAL_FIELDS,
     QUESTIONNAIRE_FIELDS,
@@ -12,6 +14,8 @@ from app.chatbot.questionnaire_bridge import (
 
 COMBINED_SCHEMA = "chat-buddy-confirmed-profile"
 COMBINED_VERSION = 1
+COMBINED_D24_VERSION = 2
+_D24_COLLECTIONS = {"datasets": "dataset", "ai_function_versions": "function", "evidence_documents": "document"}
 
 
 class ProfileImportError(ValueError):
@@ -24,6 +28,7 @@ class CombinedProfile:
 
     bridge: QuestionnaireBridge
     algorithms: D23AnswerAdapter
+    dataset_evidence: D24AnswerAdapter | None = None
 
 
 def _unique_object(pairs):
@@ -87,8 +92,13 @@ def load_confirmed_profile(raw: str | bytes) -> dict[str, dict[str, str | list[s
     }
 
 
-def dump_combined_profile(bridge: QuestionnaireBridge, algorithms: D23AnswerAdapter | None = None) -> str:
-    """Serialize confirmed D2.1–D2.3 values, excluding chat provenance and drafts."""
+def dump_combined_profile(
+    bridge: QuestionnaireBridge,
+    algorithms: D23AnswerAdapter | None = None,
+    *,
+    dataset_evidence: D24AnswerAdapter | None = None,
+) -> str:
+    """Write v1 by default, or v2 with a D2.4 adapter (which may be empty)."""
     records = []
     if algorithms is not None:
         for algorithm_id in algorithms.algorithm_ids:
@@ -99,25 +109,34 @@ def dump_combined_profile(bridge: QuestionnaireBridge, algorithms: D23AnswerAdap
                 "version": record["version"],
                 "answers": record["answers"],
             })
-    return json.dumps({
+    profile = {
         "schema": COMBINED_SCHEMA,
         "version": COMBINED_VERSION,
         "product": bridge.get_questionnaire_answers("D2.1"),
         "ai_function": bridge.get_questionnaire_answers("D2.2"),
         "algorithms": records,
-    }, indent=2, ensure_ascii=False, sort_keys=True)
+    }
+    if dataset_evidence is not None:
+        dataset_evidence.check_compatibility()
+        profile["version"] = COMBINED_D24_VERSION
+        profile["dataset_evidence"] = _dump_d24(dataset_evidence)
+    return json.dumps(profile, indent=2, ensure_ascii=False, sort_keys=True)
 
 
-def load_combined_profile(raw: str | bytes) -> CombinedProfile:
-    """Validate a versioned profile into fresh stores, or raise ProfileImportError."""
+def load_combined_profile(raw: str | bytes, *, allow_d24: bool = False) -> CombinedProfile:
+    """Validate fresh stores. Chat Buddy opts into v2; v1-only consumers stay unchanged."""
     profile = _read_json(raw)
     if not isinstance(profile, dict) or profile.get("schema") != COMBINED_SCHEMA:
         raise ProfileImportError("Expected a Chat Buddy combined profile.")
     version = profile.get("version")
-    if type(version) is not int or version != COMBINED_VERSION:
+    versions = (COMBINED_VERSION, COMBINED_D24_VERSION) if allow_d24 else (COMBINED_VERSION,)
+    if type(version) is not int or version not in versions:
         raise ProfileImportError(f"Unsupported combined profile version: {version!r}.")
-    if profile.keys() != {"schema", "version", "product", "ai_function", "algorithms"}:
-        raise ProfileImportError("Expected schema, version, product, ai_function, and algorithms sections.")
+    keys = {"schema", "version", "product", "ai_function", "algorithms"}
+    if version == COMBINED_D24_VERSION:
+        keys.add("dataset_evidence")
+    if profile.keys() != keys:
+        raise ProfileImportError(f"Expected exactly these version {version} sections: {', '.join(sorted(keys))}.")
     product = profile["product"]
     ai_function = profile["ai_function"]
     records = profile["algorithms"]
@@ -138,7 +157,79 @@ def load_combined_profile(raw: str | bytes) -> CombinedProfile:
             _load_algorithm(algorithms, record)
         except ValueError as error:
             raise ProfileImportError(f"Algorithm record {index}: {error}") from error
-    return CombinedProfile(bridge, algorithms)
+    dataset_evidence = _load_d24(profile["dataset_evidence"]) if version == COMBINED_D24_VERSION else None
+    return CombinedProfile(bridge, algorithms, dataset_evidence)
+
+
+def _dump_d24(adapter):
+    section = {"questionnaire_sha256": adapter.questionnaire_fingerprint, "gmlp": adapter.get_answers(adapter.GMLP)}
+    for collection, kind in _D24_COLLECTIONS.items():
+        records = []
+        for record_id in adapter.record_ids(kind):
+            answers = adapter.get_answers(record_id)
+            inventory = {
+                field_id.removeprefix("DEP-001."): answers.pop(field_id)
+                for field_id in tuple(answers) if field_id.startswith("DEP-001.")
+            }
+            if inventory:
+                answers["DEP-001"] = inventory
+            records.append({"record_id": record_id, "answers": answers})
+        section[collection] = records
+    return section
+
+
+def _load_d24(section):
+    if not isinstance(section, dict) or section.keys() != {"questionnaire_sha256", "gmlp", *_D24_COLLECTIONS}:
+        raise ProfileImportError("D2.4 requires dataset, evaluation and document lists, GMLP and a questionnaire fingerprint.")
+    try:
+        adapter = D24AnswerAdapter()
+    except D24CompatibilityError as error:
+        raise ProfileImportError(str(error)) from None
+    if section["questionnaire_sha256"] != adapter.questionnaire_fingerprint:
+        raise ProfileImportError(
+            "D2.4 compatibility manifest requires review. This backup uses a different questionnaire fingerprint."
+        )
+    for collection, kind in _D24_COLLECTIONS.items():
+        if not isinstance(section[collection], list):
+            raise ProfileImportError(f"D2.4 {collection} must be a list.")
+        for index, record in enumerate(section[collection], start=1):
+            try:
+                if not isinstance(record, dict) or record.keys() != {"record_id", "answers"}:
+                    raise ValueError("Expected record_id and answers.")
+                if record["record_id"] is None:
+                    raise ValueError("A record ID is required.")
+                record_id = adapter.create_record(kind, record_id=record["record_id"])
+                _load_d24_answers(adapter, record_id, record["answers"], dataset=kind == "dataset")
+            except ValueError as error:
+                raise ProfileImportError(f"D2.4 {collection} record {index}: {error}") from error
+    try:
+        _load_d24_answers(adapter, adapter.GMLP, section["gmlp"])
+    except ValueError as error:
+        raise ProfileImportError(f"D2.4 GMLP: {error}") from error
+    return adapter
+
+
+def _load_d24_answers(adapter, record_id, answers, *, dataset=False):
+    if not isinstance(answers, dict):
+        raise ValueError("Expected a confirmed answers object.")
+    answers = answers.copy()
+    if dataset:
+        if any(field_id.startswith("DEP-001.") for field_id in answers):
+            raise ValueError("DEP-001 inventory answers must be nested under DEP-001.")
+        if "DEP-001" in answers:
+            inventory = answers.pop("DEP-001")
+            if not isinstance(inventory, dict):
+                raise ValueError("DEP-001 inventory must be an object.")
+            answers.update({f"DEP-001.{key}": value for key, value in inventory.items()})
+    fields = adapter.field_ids(record_id)
+    unknown = answers.keys() - set(fields)
+    if unknown:
+        raise ValueError(f"Unknown field IDs: {', '.join(sorted(unknown))}.")
+    for field_id in fields:
+        if field_id in answers:
+            adapter.save_answer(record_id, field_id, answers[field_id])
+    if adapter.get_answers(record_id) != answers:
+        raise ValueError("The recorded answers contain an inactive conditional field.")
 
 
 def _load_algorithm(algorithms, record):
