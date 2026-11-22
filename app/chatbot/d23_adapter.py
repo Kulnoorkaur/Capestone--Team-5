@@ -30,15 +30,25 @@ class D23AnswerAdapter:
 
     def __init__(self):
         self._algorithms: dict[str, _Algorithm] = {}
+        self._next_algorithm_number = 1
 
     @property
     def algorithm_ids(self) -> tuple[str, ...]:
         return tuple(self._algorithms)
 
-    def add_algorithm(self, name: str, version: str = "") -> str:
+    def add_algorithm(self, name: str, version: str = "", *, algorithm_id: str | None = None) -> str:
         """Create a named record without confirming any questionnaire fields."""
         self._validate_identity(name, version)
-        algorithm_id = f"algorithm-{len(self._algorithms) + 1}"
+        if algorithm_id is None:
+            while True:
+                algorithm_id = f"algorithm-{self._next_algorithm_number}"
+                self._next_algorithm_number += 1
+                if algorithm_id not in self._algorithms:
+                    break
+        elif not isinstance(algorithm_id, str) or not algorithm_id.strip():
+            raise ValueError("Algorithm ID must be non-empty text.")
+        elif algorithm_id in self._algorithms:
+            raise ValueError(f"Duplicate algorithm ID: {algorithm_id}.")
         self._algorithms[algorithm_id] = _Algorithm(name, version)
         return algorithm_id
 

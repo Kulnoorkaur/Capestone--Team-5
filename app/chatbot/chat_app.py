@@ -24,6 +24,12 @@ from app.chatbot.chat_llm import (
 )
 
 from app.chatbot.d23_chat import render_d23_chat
+from app.chatbot.profile_io import (
+    CombinedProfile,
+    ProfileImportError,
+    dump_combined_profile,
+    load_combined_profile,
+)
 from app.chatbot.questionnaire_bridge import CONDITIONAL_FIELDS, QuestionnaireBridge
 
 
@@ -566,6 +572,78 @@ def restore_profile(uploaded_file):
     return True, None
 
 
+def apply_combined_profile(profile: CombinedProfile):
+    """Replace confirmed stores only after the entire upload has validated."""
+    state = st.session_state
+    state.update(
+        questionnaire_bridge=profile.bridge,
+        field_suggestions={},
+        carryover=new_carryover_state(),
+        asked_field=None,
+        asked_question=None,
+        retryable_turn=None,
+        intake_started=True,
+        questionnaire_complete=False,
+        needs_next_question=True,
+        clarification_needed=False,
+        active_questionnaire="D2.1",
+        editor_version=state.editor_version + 1,
+        review_batch_version=state.review_batch_version + 1,
+        d23_mode=False,
+        d23_adapter=profile.algorithms,
+        d23_answer_revision=state.get("d23_answer_revision", 0) + 1,
+        d23_conversations={},
+        unified_messages=[
+            {"role": "assistant", "content": WELCOME},
+            {"role": "assistant", "content": (
+                "Restored confirmed D2.1–D2.3 answers. I'll continue with any remaining questions."
+            )},
+        ],
+    )
+    state.pop("d23_active_algorithm_id", None)
+    state.pop("d23-algorithm-picker", None)
+
+
+def render_combined_profile_io():
+    with st.expander("Combined D2.1–D2.3 profile"):
+        st.download_button(
+            "Download combined D2.1–D2.3 JSON",
+            data=dump_combined_profile(bridge, st.session_state.get("d23_adapter")),
+            file_name="chat_buddy_confirmed_profile_v1.json",
+            mime="application/json",
+        )
+        uploaded = st.file_uploader(
+            "Upload combined Chat Buddy JSON", type=["json"], key="combined_profile_upload"
+        )
+        if uploaded is None:
+            return
+        try:
+            profile = load_combined_profile(uploaded.getvalue())
+        except ProfileImportError as error:
+            st.error(str(error))
+            return
+
+        st.write("Preview confirmed answers")
+        for questionnaire, label in (("D2.1", "Product profile"), ("D2.2", "AI function")):
+            answers = profile.bridge.get_questionnaire_answers(questionnaire)
+            st.caption(f"{questionnaire} — {label} · {len(answers)} confirmed answers")
+            st.json(answers, expanded=False)
+        st.caption(f"D2.3 — {len(profile.algorithms.algorithm_ids)} algorithm records")
+        for algorithm_id in profile.algorithms.algorithm_ids:
+            record = profile.algorithms.build_record(algorithm_id)
+            snapshot = profile.algorithms.get_algorithm(algorithm_id)
+            st.text(f"{record['record_name']} ({algorithm_id})")
+            st.json(snapshot["answers"], expanded=False)
+            st.caption(f"Validation findings: {len(record['validation_problems'])}. Flags: {len(record['flags'])}.")
+        st.warning(
+            "Restoring this file replaces your confirmed D2.1–D2.3 answers and clears "
+            "pending suggestions and conversation history. Chat quotes are outside this backup."
+        )
+        if st.button("Restore combined profile"):
+            apply_combined_profile(profile)
+            st.rerun()
+
+
 # ============================================================
 # SIDEBAR
 # ============================================================
@@ -636,6 +714,8 @@ with st.sidebar:
             st.rerun()
         else:
             st.error(error)
+
+    render_combined_profile_io()
 
     if st.button(
         "Start New Assessment",
