@@ -507,6 +507,7 @@ def reset_application():
         "d24_mode",
         "d24_adapter",
         "d24_revisions",
+        "d24_conversations",
     ]
 
     for key in keys:

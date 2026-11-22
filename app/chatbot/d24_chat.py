@@ -1,7 +1,8 @@
-"""Deterministic Chat Buddy controls for confirmed D2.4 answers."""
+"""Record-scoped extraction and deterministic controls for D2.4 answers."""
 
 import streamlit as st
 
+from app.chatbot.chat_llm import extract_d24_candidates
 from app.chatbot.d24_adapter import D24AnswerAdapter
 from app.chatbot.d24_metadata import D24CompatibilityError
 
@@ -39,6 +40,7 @@ def _select_record(adapter, kind):
         if st.button("Confirm removal", key=f"d24-delete-{record_id}", disabled=not confirmed) and confirmed:
             adapter.remove_record(record_id)
             st.session_state.d24_revisions.pop(record_id, None)
+            st.session_state.d24_conversations.pop(record_id, None)
             st.rerun()
     return record_id
 
@@ -52,7 +54,90 @@ def _answer_input(field, current, key):
     return st.multiselect("Draft answer", field.options, default=current or [], key=key)
 
 
-def _render_record(adapter, record_id):
+def _reconcile_suggestions(adapter, record_id, conversation):
+    pending = conversation["pending"]
+    reachable = adapter.reachable_suggestions(record_id, {
+        field_id: candidate["value"] for field_id, candidate in pending.items()
+    })
+    conversation["pending"] = {field_id: pending[field_id] for field_id in reachable}
+
+
+def _render_extraction(adapter, record_id, scope, target, conversation):
+    for message in conversation["turns"][-3:]:
+        with st.chat_message("user"):
+            st.text(message)
+    if conversation["notice"]:
+        st.info(conversation["notice"])
+    if conversation["pending"]:
+        st.caption("A new message replaces unconfirmed suggestions for this record.")
+    message = st.chat_input(
+        "Describe the selected record or answer the current question",
+        key=f"d24-message-{record_id}", max_chars=8000,
+    )
+    if not message:
+        return
+    turns = conversation["turns"]
+    source_id = str(len(turns) + 1)
+    conversation["pending"] = {}
+    labels = {}
+    for kind, (_, name_field) in _RECORDS.items():
+        for other_id in adapter.record_ids(kind):
+            labels[other_id] = adapter.get_answers(other_id).get(name_field, "")
+    try:
+        with st.spinner("Reviewing your message…"):
+            suggestions, clarification = extract_d24_candidates(
+                message, record_id=record_id, scope=scope,
+                record_label=labels.get(record_id) or ("Profile-wide GMLP" if scope == adapter.GMLP else record_id),
+                source_id=source_id, fields=adapter.field_variants(record_id),
+                active_fields=adapter.active_fields(record_id), target_field=target,
+                confirmed=adapter.get_answers(record_id),
+                other_labels=tuple(label for other_id, name in labels.items() if other_id != record_id
+                                   for label in (other_id, name)),
+                previous=tuple(turns[-6:]),
+            )
+    except Exception:
+        conversation["notice"] = "Gemini could not process this message. You can continue with the manual controls."
+    else:
+        conversation["pending"] = suggestions
+        _reconcile_suggestions(adapter, record_id, conversation)
+        conversation["notice"] = clarification or (
+            "" if suggestions and conversation["pending"]
+            else "I couldn't verify an answer for this record. Please clarify or use the manual controls."
+        )
+    turns.append(message)
+    st.rerun()
+
+
+def _render_suggestions(adapter, record_id, active, revision, conversation):
+    _reconcile_suggestions(adapter, record_id, conversation)
+    for field_id, candidate in conversation["pending"].items():
+        if field_id not in active:
+            continue
+        field = active[field_id]
+        key = f"d24-review-{record_id}-{candidate['source_id']}-{field_id}-{revision}"
+        with st.expander(f"Review suggestion for {field_id}", expanded=True):
+            st.write(field.prompt)
+            st.caption(f"User quotation · turn {candidate['source_id']}")
+            st.text(candidate["quote"])
+            if candidate["explanation"]:
+                st.caption("Gemini explanation · not document evidence")
+                st.text(candidate["explanation"])
+            draft = _answer_input(field, candidate["value"], key)
+            confirm, reject = st.columns(2)
+            if confirm.button("Confirm suggestion", key=f"{key}-confirm"):
+                try:
+                    adapter.save_answer(record_id, field_id, draft)
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    st.session_state.d24_revisions[record_id] = revision + 1
+                    st.rerun()
+            if reject.button("Reject suggestion", key=f"{key}-reject"):
+                conversation["pending"].pop(field_id)
+                st.rerun()
+
+
+def _render_record(adapter, record_id, scope):
     active = adapter.active_fields(record_id)
     answers = adapter.get_answers(record_id)
     unanswered = [field_id for field_id in active if field_id not in answers]
@@ -88,6 +173,9 @@ def _render_record(adapter, record_id):
         st.write(f"**{field_id}**")
         st.write(field.prompt)
     key = f"d24-answer-{record_id}-{field_id}-{revision}"
+    conversation = st.session_state.d24_conversations.setdefault(
+        record_id, {"turns": [], "pending": {}, "notice": ""},
+    )
     draft = _answer_input(field, answers.get(field_id), key)
     st.caption("Review your draft. It is saved only when you confirm it.")
     if st.button("Confirm D2.4 answer", key=f"{key}-confirm"):
@@ -98,6 +186,8 @@ def _render_record(adapter, record_id):
         else:
             st.session_state.d24_revisions[record_id] = revision + 1
             st.rerun()
+    _render_extraction(adapter, record_id, scope, field_id, conversation)
+    _render_suggestions(adapter, record_id, active, revision, conversation)
 
 
 def render_d24_chat():
@@ -115,6 +205,7 @@ def render_d24_chat():
 
     adapter = state.d24_adapter
     state.setdefault("d24_revisions", {})
+    state.setdefault("d24_conversations", {})
     labels = {kind: label for kind, (label, _) in _RECORDS.items()}
     labels[adapter.GMLP] = "Profile-wide GMLP"
     kind = st.radio("Dataset and evidence section", tuple(labels), format_func=labels.get, key="d24-section")
@@ -124,4 +215,4 @@ def render_d24_chat():
     else:
         record_id = _select_record(adapter, kind)
     if record_id is not None:
-        _render_record(adapter, record_id)
+        _render_record(adapter, record_id, kind)

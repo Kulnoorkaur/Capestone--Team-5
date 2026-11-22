@@ -73,6 +73,28 @@ class D24AnswerAdapter:
         record = self._record(record_id)
         return self._metadata.project(record.kind, record.answers)[1]
 
+    def field_variants(self, record_id):
+        return self._metadata.field_variants(self._record(record_id).kind)
+
+    def reachable_suggestions(self, record_id, proposed):
+        """Try proposed answers in questionnaire order against a temporary record."""
+        record = self._record(record_id)
+        simulated = dict(record.answers)
+        reachable = []
+        for field_id in self._metadata.field_ids(record.kind):
+            if field_id in simulated or field_id not in proposed:
+                continue
+            _, active = self._metadata.project(record.kind, simulated)
+            if field_id not in active:
+                continue
+            try:
+                active[field_id].check(proposed[field_id])
+            except ValueError:
+                continue
+            simulated[field_id] = proposed[field_id]
+            reachable.append(field_id)
+        return tuple(reachable)
+
     def save_answer(self, record_id, field_id, value):
         record = self._record(record_id)
         field = self.active_fields(record_id).get(field_id)

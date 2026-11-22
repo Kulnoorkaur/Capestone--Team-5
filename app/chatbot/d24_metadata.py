@@ -292,16 +292,24 @@ class _Metadata:
     programs: dict
     fingerprint: str
 
-    def field_ids(self, scope):
+    def field_variants(self, scope):
         def collect(program):
             for instruction in program:
                 if isinstance(instruction, _Branch):
                     yield from collect(instruction.when_true)
                     yield from collect(instruction.when_false)
                 elif instruction.field_id is not None:
-                    yield instruction.field_id
+                    yield instruction.field_id, instruction.value.field
 
-        return tuple(dict.fromkeys(collect(self.programs[scope])))
+        fields = {}
+        for field_id, field in collect(self.programs[scope]):
+            variants = fields.setdefault(field_id, [])
+            if field not in variants:
+                variants.append(field)
+        return fields
+
+    def field_ids(self, scope):
+        return tuple(self.field_variants(scope))
 
     def project(self, scope, confirmed):
         values, fields, local = {}, {}, {}
