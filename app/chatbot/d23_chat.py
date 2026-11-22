@@ -17,6 +17,37 @@ from app.deliverable_2.questionnaires.algorithm_change_control import (
 )
 
 
+_QUESTIONS = {
+    "ACC-001": "What name and version identify this algorithm or model release?",
+    "ACC-002": "Which of the AI functions already described for this product does this algorithm implement?",
+    "ACC-003": "What learning approach or technique does this algorithm use?",
+    "ACC-004": "What model architecture does the algorithm use, and does it use one model or several?",
+    "ACC-006": "Does the same input produce the same output when the software version is unchanged? "
+               "If not, what causes the output to vary?",
+    "ACC-010": "What triggers learning, what data does it use, and who or what approves a change before it takes effect?",
+    "ACC-011": "What safeguards limit changes the algorithm learns or settings that sites can configure?",
+    "ACC-016": "For each planned modification, what will change, what limits apply, "
+               "and how do you expect performance to be affected?",
+    "ACC-017": "Would any planned change affect the product's intended use, indications, users, "
+               "population, inputs, outputs, or performance claims? If so, which confirmed profile entries would change?",
+    "ACC-018": "Will retraining use data from a different source, site, device vendor, or population "
+               "than the original? If so, which dataset record describes that data?",
+    "ACC-019": "Do you have a documented plan that specifies each planned change and how you will verify it? "
+               "If so, identify the document and framework, such as a predetermined change control plan (PCCP).",
+    "ACC-020": "Where does your algorithm's change-control plan stand with Health Canada, FDA, EU MDR "
+               "(Medical Device Regulation), and the EU AI Act? For each framework, tell me whether it has "
+               "been submitted, is planned for submission, is under review, has been authorized or accepted, "
+               "or if another status applies.",
+    "ACC-021": "Is there a documented procedure for controlling software and algorithm changes "
+               "within your quality management system (QMS)? If so, provide its ID and version.",
+    "ACC-029": "What changes, if any, have you made since the last regulatory authorization or first release?",
+}
+
+
+def _question(field_id):
+    return _QUESTIONS.get(field_id) or conversational_question(BY_ID[field_id]["label"])
+
+
 def _identity(record):
     return f"{record['name']} — {record['version'] or 'version not provided'}"
 
@@ -39,7 +70,7 @@ def d23_section_gaps():
         if problems:
             incomplete.append(algorithm_id)
         name = _identity(adapter.get_algorithm(algorithm_id))
-        gaps.extend(f"{name} · {conversational_question(BY_ID[issue['id']]['label'])} · {issue['problem']}"
+        gaps.extend(f"{name} · {_question(issue['id'])} · {issue['problem']}"
                     for issue in problems)
     active_id = st.session_state.get("d23_active_algorithm_id")
     return gaps, active_id if active_id in incomplete else next(iter(incomplete), None)
@@ -115,21 +146,49 @@ def _submit_turn(adapter, conversation, algorithm_id, field_id, message, *, init
     bridge = st.session_state.get("questionnaire_bridge")
     d22_answers = bridge.get_questionnaire_answers("D2.2") if bridge else {}
     pending = conversation["candidates"].get(field_id)
-    followup = pending if pending and _missing_details(field_id, pending) else None
+    framework_followup = pending and pending.get("unresolved_frameworks")
+    followup = pending if pending and not framework_followup and _missing_details(field_id, pending) else None
+    existing = algorithm["answers"].get(field_id)
+    if existing and not pending and not _complete(field_id, existing) and needs_details(field_id, existing["value"]):
+        followup = {
+            "algorithm_id": algorithm_id, "field_id": field_id, "source_id": source_id,
+            "value": existing["value"], "details": existing["details"],
+            "quote": algorithm["source_quotes"].get(field_id) or message, "correction": False,
+        }
     try:
         suggestions, clarification = extract_d23_candidates(
             message, algorithm_id=algorithm_id, algorithm=algorithm, source_id=source_id,
             active_fields=active, target_field=field_id,
             other_algorithm_names=other_names,
             d22_answers=d22_answers,
+            d21_answers=bridge.get_questionnaire_answers("D2.1") if bridge else {},
             d22_labels={key: bridge.get_field_label(key) for key in d22_answers},
             detail_followup=followup,
-            original_reply=conversation["turns"][int(followup["source_id"]) - 1] if followup else None,
+            original_reply=conversation["turns"][int(pending["source_id"]) - 1] if pending and followup else None,
         )
     except Exception:
         conversation["request_failed"] = True
         conversation["notice"] = "Gemini could not process that answer. Your message is retained. You can answer using the controls below."
         return
+    if framework_followup and field_id in suggestions and not suggestions[field_id]["correction"]:
+        updated = suggestions[field_id]
+        additions = {key: status for key, status in updated["value"].items() if key in framework_followup}
+        if additions:
+            suggestions[field_id] = {
+                **pending, "value": {**pending["value"], **additions},
+                "details": " ".join(filter(None, (pending["details"], updated["quote"]))),
+                "detail_source_id": source_id,
+                "unresolved_frameworks": [key for key in framework_followup if key not in additions],
+            }
+        else:
+            suggestions.pop(field_id)
+    if existing and field_id == "ACC-020" and field_id in suggestions and not suggestions[field_id]["correction"]:
+        candidate = suggestions[field_id]
+        previous_statuses = {key: status for key, status in existing["value"].items() if status is not None}
+        candidate["value"] = {**candidate["value"], **previous_statuses}
+        candidate["unresolved_frameworks"] = [key for key in candidate.get("unresolved_frameworks", ())
+                                              if key not in previous_statuses]
+        candidate["details"] = " ".join(filter(None, (existing["details"], candidate["details"])))
     for field, candidate in suggestions.items():
         rejected = conversation["rejected"].get(field, ())
         details = _evidence_key(candidate["details"])
@@ -141,9 +200,15 @@ def _submit_turn(adapter, conversation, algorithm_id, field_id, message, *, init
         ):
             continue
         conversation["candidates"][field] = candidate
-    conversation["notice"] = clarification or (
-        "" if suggestions or initial else "I couldn't identify a supported answer in that message."
-    )
+    if (followup or framework_followup) and field_id not in suggestions:
+        conversation["notice"] = clarification or (
+            "I kept the information you already supplied. You can fill the remaining detail directly "
+            "in the review card below."
+        )
+    else:
+        conversation["notice"] = clarification or (
+            "" if suggestions or initial else "I couldn't identify a supported answer in that message."
+        )
 
 
 def _active_suggestions(adapter, algorithm_id, active, conversation):
@@ -174,6 +239,10 @@ def _save_answer(adapter, algorithm_id, field_id, value, details, evidence, conv
     for removed in obsolete:
         conversation["candidates"].pop(removed, None)
     conversation["skipped"].difference_update(obsolete)
+    if conversation.get("notice_target") == field_id:
+        conversation["notice"] = ""
+        conversation["notice_target"] = None
+        conversation["request_failed"] = False
     st.session_state.d23_answer_revision += 1
     st.rerun()
 
@@ -199,12 +268,14 @@ def _same_value(left, right):
 
 
 def _missing_details(field_id, candidate):
-    return needs_details(field_id, candidate["value"]) and (
+    return bool(candidate.get("unresolved_frameworks")) or needs_details(field_id, candidate["value"]) and (
         not candidate["details"].strip() or bool(candidate.get("missing_detail"))
     )
 
 
 def _detail_question(field_id, candidate):
+    if frameworks := candidate.get("unresolved_frameworks"):
+        return f"Which status applies to the change plan for {', '.join(frameworks)}? You can reply in chat or select a status below."
     if candidate.get("missing_detail"):
         return candidate["missing_detail"]
     value = candidate["value"]
@@ -219,15 +290,15 @@ def _detail_question(field_id, candidate):
 
 def _render_reference_context(value):
     bridge = st.session_state.get("questionnaire_bridge")
-    answers = bridge.get_questionnaire_answers("D2.2") if bridge else {}
-    for field in dict.fromkeys(re.findall(r"\bAIF-\d{3}(?:-[A-Z]+)?\b", value)):
+    answers = bridge.get_product_profile() if bridge else {}
+    for field in dict.fromkeys(re.findall(r"\b(?:PIP|AIF)-\d{3}(?:-[A-Z]+)?\b", value)):
         if field in answers:
             answer = answers[field]
             description = ", ".join(answer) if isinstance(answer, list) else answer
             st.caption(f"{field} · {bridge.get_field_label(field)}")
             st.text(description)
         else:
-            st.caption(f"{field} · No confirmed D2.2 answer for this reference.")
+            st.caption(f"{field} · No confirmed profile answer for this reference.")
 
 
 def _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggestions, detail_target):
@@ -237,7 +308,7 @@ def _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggesti
         definition = BY_ID[field_id]
         review_source = candidate.get("detail_source_id", candidate["source_id"])
         key = f"d23-review-{algorithm_id}-{review_source}-{field_id}"
-        with st.expander(conversational_question(definition["label"]), expanded=True):
+        with st.expander(_question(field_id), expanded=True):
             st.text(_identity(algorithm))
             st.text(f"Source turn {candidate['source_id']}: {candidate['quote']}")
             value = _answer_input(definition, candidate["value"], key)
@@ -245,7 +316,12 @@ def _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggesti
                 _render_reference_context(value)
             if "detail_source_id" in candidate:
                 st.caption(f"Explanation supplied in follow-up turn {candidate['detail_source_id']}.")
-            details, evidence = _answer_metadata(field_id, value, key, details=candidate["details"])
+            existing = algorithm["answers"].get(field_id, {})
+            details, evidence = _answer_metadata(
+                field_id, value, key, details=candidate["details"], evidence=existing.get("evidence", ""),
+            )
+            if field_id == "ACC-017":
+                _render_reference_context(details)
             if field_id == detail_target:
                 if not details.strip():
                     st.caption("I couldn't verify an explanation. Add it in chat or edit it here.")
@@ -399,7 +475,7 @@ def render_d23_chat():
 
     # Reserve the main conversation above the technical controls.
     chat = st.container()
-    tools = st.expander("Manage algorithms and answers", expanded=False)
+    tools = st.expander("Manage algorithms and answers", expanded=state.get("d23_show_manual", False))
     with tools:
         algorithm_id = _algorithm_tools(adapter, state)
 
@@ -484,7 +560,8 @@ def render_d23_chat():
         current = detail_target or target
         same_target = current is not None and conversation.get("notice_target") == current
         notice = conversation["notice"] if same_target or conversation.get("notice_target") is None else ""
-        if notice and (not detail_target or conversation.get("request_failed")):
+        if notice and (not detail_target or conversation.get("request_failed")
+                       or notice.startswith("I kept the information")):
             with st.chat_message("assistant"):
                 st.write(notice)
         question = None
@@ -493,10 +570,19 @@ def render_d23_chat():
             if detail_target:
                 question = _detail_question(detail_target, suggestions[detail_target])
         elif target:
-            question = conversational_question(BY_ID[target]["label"])
+            question = _question(target)
+            existing = algorithm["answers"].get(target)
+            if existing and target == "ACC-020":
+                missing = [name for name in FRAMEWORKS if not (existing["value"] or {}).get(name)]
+                if missing:
+                    question = f"What is the change-plan status for {', '.join(missing)}?"
+            elif existing and needs_details(target, existing["value"]):
+                question = _detail_question(target, existing)
             if same_target and target == "ACC-002":
-                question = ("Which confirmed D2.2 entries describe what this algorithm implements? "
-                            "Include their AIF references if you know them, or describe the matching capability more specifically.")
+                question = ("Which confirmed AI-function entries describe what this algorithm implements? "
+                            "You can describe the matching capability in your own words.")
+            elif same_target and target == "ACC-020":
+                question = "Choose a listed status for each framework you can confirm, or tell me the status in chat."
             elif same_target:
                 options = BY_ID[target]["options"]
                 if BY_ID[target]["type"] == "select" and 1 < len(options) <= 4:
@@ -505,6 +591,25 @@ def render_d23_chat():
                     question = "You can clarify your answer in chat, edit it manually, or skip for now."
             with st.chat_message("assistant"):
                 st.write(question)
+                if target == "ACC-020" and same_target:
+                    st.caption("Available statuses: " + " · ".join(BY_ID[target]["options"]))
+                context_ref = {"ACC-001": "PIP-001", "ACC-007": "AIF-009"}.get(target)
+                bridge = state.get("questionnaire_bridge")
+                if context_ref and bridge and context_ref in bridge.answers:
+                    st.caption(f"Previously confirmed · {bridge.get_field_label(context_ref)}")
+                    st.write(bridge.answers[context_ref])
+            if bridge and target in {"ACC-002", "ACC-017"}:
+                entries = bridge.get_questionnaire_answers("D2.2")
+                if target == "ACC-017":
+                    entries = {**bridge.get_questionnaire_answers("D2.1"), **entries}
+                if entries:
+                    with st.expander("Review previously confirmed profile information"):
+                        for field, answer in entries.items():
+                            st.caption(bridge.get_field_label(field))
+                            st.write(", ".join(answer) if isinstance(answer, list) else answer)
+            if same_target and st.button("Edit this answer manually", key=f"d23-manual-{algorithm_id}-{target}"):
+                state.d23_show_manual = True
+                st.rerun()
             _question_actions(adapter, algorithm_id, target, conversation)
         elif adapter.build_record(algorithm_id)["validation_problems"]:
             with st.chat_message("assistant"):

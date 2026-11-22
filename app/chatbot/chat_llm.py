@@ -465,15 +465,6 @@ def _d23_has_direct_basis(field_id, value, quote):
             words,
         ):
             return False
-    if field_id == "ACC-020" and isinstance(value, dict) and "Authorized or accepted" in value.values():
-        # Require an explicit approval claim in the quote. A bare future
-        # submission does not support authorization.
-        if not re.search(r"\b(?:authorized|accepted|approved|authorised)\b", words):
-            return False
-        if re.search(r"\b(?:not|never) (?:yet )?(?:authorized|accepted|approved|authorised)\b", words):
-            return False
-        if re.search(r"\b(?:planned submission|plans? to submit|will submit)\b", words):
-            return False
     if field_id == "ACC-023" and re.search(
         r"\b(?:plans? to|will|intends? to) (?:run|test|verify|validate|perform)\b",
         words,
@@ -483,14 +474,15 @@ def _d23_has_direct_basis(field_id, value, quote):
     return True
 
 
-def _d23_reference_supported(value, quote, evidence, d22_answers):
+def _d23_reference_supported(value, quote, evidence, confirmed_answers, *, prefixes="AIF"):
     if not isinstance(value, str):
         return False
-    references = set(re.findall(r"\bAIF-\d{3}(?:-[A-Z]+)?\b", value))
+    reference_id = rf"(?:{prefixes})-\d{{3}}(?:-[A-Z]+)?"
+    references = set(re.findall(rf"\b{reference_id}\b", value))
     if references and all(re.search(rf"\b{reference}(?![-\w])", quote) for reference in references):
         return True
     if not references or not isinstance(evidence, dict) or not re.fullmatch(
-        r"AIF-\d{3}(?:-[A-Z]+)?(?:\s*(?:[,;]|\band\b)\s*AIF-\d{3}(?:-[A-Z]+)?)*", value.strip()
+        rf"{reference_id}(?:\s*(?:[,;]|\band\b)\s*{reference_id})*", value.strip()
     ):
         return False
 
@@ -502,7 +494,7 @@ def _d23_reference_supported(value, quote, evidence, d22_answers):
         }
 
     for reference in references:
-        answer = d22_answers.get(reference)
+        answer = confirmed_answers.get(reference)
         excerpts = answer if isinstance(answer, list) else [answer]
         snippet = evidence.get(reference)
         if not any(isinstance(item, str) and _quoted_in(snippet, item) for item in excerpts):
@@ -512,10 +504,62 @@ def _d23_reference_supported(value, quote, evidence, d22_answers):
     return True
 
 
+_D23_FRAMEWORK_NAMES = {
+    "Health Canada": r"Health Canada|HC",
+    "FDA": r"(?:U\.?S\.?\s+)?FDA",
+    "EU MDR": r"(?:EU|European Union)\s+MDR|(?:EU\s+)?Medical Device Regulation|MDR",
+    "EU AI Act": r"(?:EU|European Union)\s+AI Act|AI Act",
+}
+
+
+def _d23_framework_statuses(quote):
+    """Recognize explicit statuses only within the clause naming a framework."""
+    patterns = {
+        "Not submitted": r"\b(?:not (?:yet )?submitted|no submission|hasn't been submitted)\b",
+        "Planned for submission": r"\b(?:planned (?:for .*?submission|submission)|plans? to submit|will submit)\b",
+        "Under review": r"\b(?:under (?:\w+ )?review|review (?:is )?in progress)\b",
+        "Authorized or accepted": r"\b(?:authori[sz]ed|accepted|approved)\b",
+        "Not applicable (give rationale)": r"\bnot applicable\b",
+        "Unknown": r"\b(?:unknown|not known)\b",
+    }
+    results, mentioned = {}, set()
+    for sentence in re.split(r"[\n]|(?<=[.!?])\s+", quote):
+        if sentence.rstrip().endswith("?"):
+            continue
+        clauses = []
+        for part in re.split(r"[,;]", sentence):
+            frameworks = {key for key, pattern in _D23_FRAMEWORK_NAMES.items()
+                          if re.search(rf"\b(?:{pattern})\b", part, re.I)}
+            if frameworks:
+                clauses.append((frameworks, part))
+            elif clauses:
+                previous_frameworks, previous_text = clauses[-1]
+                clauses[-1] = previous_frameworks, f"{previous_text}, {part}"
+        for frameworks, clause in clauses:
+            mentioned.update(frameworks)
+            statuses = {key for key, pattern in patterns.items() if re.search(pattern, clause, re.I)}
+            if re.search(
+                r"\b(?:not|never|pending|awaiting|will|would|may|expect(?:s|ed)?)\b"
+                r"[^.!?]*\b(?:authori[sz]ed|accepted|approved)\b"
+                r"|\baccepted (?:for (?:filing|review|processing)|receipt)\b"
+                r"|\b(?:internally|manufacturer) approved\b", clause, re.I,
+            ):
+                statuses.discard("Authorized or accepted")
+            if re.search(r"\b(?:not|never|pending|awaiting)\b[^.!?]*\bunder (?:\w+ )?review\b", clause, re.I):
+                statuses.discard("Under review")
+            if statuses == {"Not submitted", "Planned for submission"}:
+                statuses.remove("Not submitted")
+            if len(statuses) == 1:
+                for framework in frameworks:
+                    results.setdefault(framework, set()).update(statuses)
+    return ({key: next(iter(statuses)) for key, statuses in results.items() if len(statuses) == 1}, mentioned)
+
+
 def _d23_explanation(details, source):
     excerpts = details if isinstance(details, list) else [details]
-    if excerpts and all(_quoted_in(excerpt, source) for excerpt in excerpts):
-        explanation = " ".join(dict.fromkeys(excerpts))
+    verified = [excerpt for excerpt in excerpts if _quoted_in(excerpt, source)]
+    if verified:
+        explanation = " ".join(dict.fromkeys(verified))
         if explanation.strip(" .!?").casefold() not in {"yes", "no", "unknown"}:
             return explanation
     return ""
@@ -535,7 +579,7 @@ def _d23_direct_reply(message, options):
 def extract_d23_candidates(
     message, *, algorithm_id, algorithm, source_id, active_fields,
     target_field=None, other_algorithm_names=(), d22_answers=None, d22_labels=None,
-    detail_followup=None, original_reply=None,
+    detail_followup=None, original_reply=None, d21_answers=None,
 ):
     """Extract quoted candidates for a single algorithm. Do not save answers."""
     from app.deliverable_2.questionnaires.algorithm_change_control import FIELDS, FRAMEWORKS, needs_details
@@ -549,10 +593,13 @@ def extract_d23_candidates(
             "details_required_for": field["detail_on"],
         }
         for field in FIELDS
-        if (correction or field["id"] not in confirmed)
+        if (correction or field["id"] not in confirmed or (
+            field["id"] == target_field and (detail_followup or field["type"] == "perframework")
+        ))
         and (not detail_followup or field["id"] == target_field)
     }
-    d22_answers = (d22_answers or {}) if "ACC-002" in fields else {}
+    d22_answers = (d22_answers or {}) if {"ACC-002", "ACC-017"} & fields.keys() else {}
+    d21_answers = (d21_answers or {}) if "ACC-017" in fields else {}
     payload = {
         "algorithm_id": algorithm_id,
         "algorithm_name": algorithm["name"],
@@ -564,6 +611,7 @@ def extract_d23_candidates(
         "fields": fields,
         "frameworks": FRAMEWORKS,
         "confirmed_d22_answers": d22_answers,
+        "confirmed_d21_answers": d21_answers,
         "confirmed_d22_labels": {key: label for key, label in (d22_labels or {}).items() if key in d22_answers},
         "pending_answer_followup": detail_followup,
         "original_reply": original_reply,
@@ -620,6 +668,12 @@ inferred references, return only the IDs as a comma-separated string and include
 reference_evidence mapping each ID to an exact excerpt of its confirmed D2.2
 answer showing the match. Omit ACC-002 and ask which reference applies if the
 link is uncertain. A general mention of D2.2 does not identify a reference.
+For ACC-017, use references (a comma-separated string) and reference_evidence
+in the same way for affected confirmed D2.1/D2.2 answers. Include exact
+supporting wording about the change in details. Never invent a reference.
+For ACC-020, use only the listed frameworks and exact owner status choices.
+Check each framework independently. Drafting a plan does not imply submission,
+and pending conformity assessment does not imply review of the change plan.
 
 {json.dumps(payload, ensure_ascii=False)}
 """
@@ -656,16 +710,23 @@ link is uncertain. A general mention of D2.2 does not identify a reference.
         ):
             continue
         value = proposed["value"]
-        if field_id == "ACC-020" and isinstance(value, dict):
-            if value.keys() - set(FRAMEWORKS):
-                continue
-            # A supported status for one framework says nothing about the others.
-            value = {
-                framework: status for framework, status in value.items()
-                if status is not None and mentions_name(quote, framework)
-            }
+        unresolved_frameworks = set()
+        if field_id == "ACC-020":
+            statuses, mentioned = _d23_framework_statuses(quote)
+            proposed_statuses = value.values() if isinstance(value, dict) else ()
+            if "Authorized or accepted" in proposed_statuses:
+                statuses = {key: status for key, status in statuses.items()
+                            if status == "Authorized or accepted" or value.get(key) != "Authorized or accepted"}
+            value = statuses
+            unresolved_frameworks = mentioned - value.keys()
             if not value:
                 continue
+        elif fields[field_id]["type"] in {"select", "multiselect"}:
+            options = {option.casefold(): option for option in fields[field_id]["options"]}
+            if isinstance(value, str):
+                value = options.get(value.strip().casefold(), value)
+            elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+                value = [options.get(item.strip().casefold(), item) for item in value]
         if not _d23_has_direct_basis(field_id, value, quote):
             continue
         if field_id == "ACC-002" and not _d23_reference_supported(
@@ -673,18 +734,51 @@ link is uncertain. A general mention of D2.2 does not identify a reference.
         ):
             continue
         source = quote if other_mentions else message
-        details = _d23_explanation(proposed.get("details", ""), source)
+        details = _d23_explanation(proposed.get("details") or proposed.get("explanation"), source)
         if not details and field_id == target_field and direct and value == direct[0]:
             details = direct[2]
+        if (not details and not (proposed.get("details") or proposed.get("explanation"))
+                and fields[field_id]["type"] in {"select", "multiselect"}):
+            selections = [value] if isinstance(value, str) else value
+            if isinstance(selections, list) and all(isinstance(item, str) for item in selections):
+                if len(quote.split()) >= 5 and quote.strip(" .!?") not in selections:
+                    details = quote
+        if field_id == "ACC-017":
+            references = proposed.get("references")
+            if references and _d23_reference_supported(
+                references, quote, proposed.get("reference_evidence"),
+                {**d21_answers, **d22_answers}, prefixes="PIP|AIF",
+            ):
+                details = " ".join(filter(None, (details, f"Affected profile entries: {references}.")))
         suggestions[field_id] = {
             "algorithm_id": algorithm_id, "field_id": field_id, "source_id": source_id,
             "quote": quote, "value": value,
             "details": details,
             "correction": correction,
         }
+        if unresolved_frameworks:
+            suggestions[field_id]["unresolved_frameworks"] = sorted(unresolved_frameworks)
         missing_detail = proposed.get("missing_detail")
         if needs_details(field_id, value) and isinstance(missing_detail, str) and missing_detail.strip():
             suggestions[field_id]["missing_detail"] = missing_detail.strip()[:300]
+    if target_field == "ACC-020" and target and not other_mentions and not detail_followup:
+        value, mentioned = _d23_framework_statuses(message)
+        proposed_status = suggestions.pop(target_field, {})
+        if value:
+            suggestions[target_field] = {
+                "algorithm_id": algorithm_id, "field_id": target_field, "source_id": source_id,
+                "quote": message, "value": value, "details": proposed_status.get("details", ""),
+                "correction": correction, "unresolved_frameworks": sorted(mentioned - value.keys()),
+            }
+    if target_field == "ACC-007" and target and not other_mentions and not detail_followup:
+        release_only = "Changed only by manufacturer release"
+        if (release_only in target["options"] and "?" not in message
+                and re.search(r"\bchanges? require\b[^.!?]*\bmanufacturer\b[^.!?]*\brelease\b", message, re.I)
+                and not re.search(r"\b(?:would|might|may|could|if|not|no|site.configur\w*|user.configur\w*)\b", message, re.I)):
+            suggestions[target_field] = {
+                "algorithm_id": algorithm_id, "field_id": target_field, "source_id": source_id,
+                "quote": message, "value": release_only, "details": message, "correction": correction,
+            }
     if direct and target_field not in suggestions and not result.get("clarification"):
         value, quote, details = direct
         if _d23_has_direct_basis(target_field, value, quote):
@@ -706,6 +800,9 @@ link is uncertain. A general mention of D2.2 does not identify a reference.
                 updated["missing_detail"] = remaining.strip()[:300]
             suggestions[target_field] = updated
     clarification = result.get("clarification", "")
+    if target_field == "ACC-020" and target_field not in suggestions and not clarification:
+        clarification = ("Which framework and status do you mean? Developing documentation or waiting for a "
+                         "conformity assessment does not establish that the change plan has been submitted or is under review.")
     return suggestions, clarification.strip() if isinstance(clarification, str) else ""
 
 

@@ -102,8 +102,8 @@ class GuidedConversationTests(unittest.TestCase):
         proposed["ACC-002"] = {"value": "Retinal screening", "quote": FUNCTION_DESCRIPTION}
         self.submit(key, FUNCTION_DESCRIPTION)
         self.assertTrue(any("couldn't identify a supported answer" in node.value for node in self.app.markdown))
-        self.assertTrue(any("Which confirmed D2.2 entries" in node.value for node in self.app.markdown))
-        self.assertFalse(any(node.value == "Which AI function(s) from Deliverable 2.2 does this algorithm implement?"
+        self.assertTrue(any("Which confirmed AI-function entries" in node.value for node in self.app.markdown))
+        self.assertFalse(any(node.value == "Which of the AI functions from Deliverable 2.2 does this algorithm implement?"
                              for node in self.app.markdown))
         proposed["ACC-002"].update(value="AIF-006", reference_evidence={"AIF-006": evidence})
         self.submit(key, FUNCTION_DESCRIPTION)
@@ -224,6 +224,122 @@ class GuidedConversationTests(unittest.TestCase):
         self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-012"]["details"],
                          f"{data_path} {screening}")
 
+    def test_controlled_manufacturer_release_overrides_bare_fixed_selection(self):
+        proposed = {}
+        self.mock_proposals("D2.3", proposed)
+        adapter, record = self.start_algorithm_at("ACC-007")
+        response = ("These settings are fixed after release. Any changes require manufacturer "
+                    "approval, validation, and a controlled software release.")
+        proposed["ACC-007"] = {"value": "Fixed", "quote": "These settings are fixed after release."}
+        self.submit(f"d23-chat-input-{record}", response)
+        key = f"d23-review-{record}-2-ACC-007"
+        self.assertEqual(self.app.selectbox(key=key).value, "Changed only by manufacturer release")
+        self.assertEqual(self.app.text_area(key=f"{key}-details").value, response)
+        self.assertNotIn("ACC-007", adapter.get_algorithm(record)["answers"])
+        self.click("Confirm suggestion")
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-007"]["details"], response)
+
+    def test_multiselect_preserves_verified_excerpts(self):
+        proposed = {}
+        self.mock_proposals("D2.3", proposed)
+        adapter, record = self.start_algorithm_at("ACC-003")
+        quote = "The algorithm uses supervised learning and fine-tunes a pre-trained model."
+        details = "Training uses labeled examples reviewed by two specialists."
+        proposed["ACC-003"] = {
+            "value": ["supervised", "Fine-tuned pre-trained/foundation model"], "quote": quote,
+            "explanation": [details, "Invented details"],
+        }
+        self.submit(f"d23-chat-input-{record}", f"{quote} {details}")
+        key = f"d23-review-{record}-2-ACC-003"
+        self.assertEqual(self.app.text_area(key=f"{key}-details").value, details)
+        self.click("Confirm suggestion")
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-003"]["value"],
+                         ["Supervised", "Fine-tuned pre-trained/foundation model"])
+
+    def open_framework_status_question(self):
+        adapter, record = self.start_algorithm_at("ACC-013")
+        adapter.save_answer(record, "ACC-013", "Yes")
+        for field in adapter.active_field_ids(record):
+            if field == "ACC-020":
+                break
+            if field in adapter.get_algorithm(record)["answers"]:
+                continue
+            definition = BY_ID[field]
+            options = definition["options"]
+            value = options[0] if options else "Verified change plan"
+            if definition["type"] == "multiselect":
+                value = [value]
+            adapter.save_answer(record, field, value, details="Confirmed details")
+        self.app.run()
+        return adapter, record
+
+    def test_framework_statuses_survive_malformed_model_statuses_and_followup(self):
+        proposed = {}
+        self.mock_proposals("D2.3", proposed)
+        adapter, record = self.open_framework_status_question()
+        self.assertTrue(any("Medical Device Regulation" in node.value for node in self.app.markdown))
+        response = ("Health Canada: PCCP under development, not submitted or authorized. "
+                    "FDA: PCCP under development, not submitted or authorized. EU MDR: "
+                    "Change-control documentation under development; conformity assessment pending.")
+        proposed["ACC-020"] = {
+            "value": {"HC": "Draft", "U.S. FDA": "Draft", "EU MDR": "Pending conformity assessment"},
+            "quote": response,
+        }
+        self.submit(f"d23-chat-input-{record}", response)
+        key = f"d23-review-{record}-2-ACC-020"
+        self.assertEqual(self.app.selectbox(key=f"{key}-Health Canada").value, "Not submitted")
+        self.assertEqual(self.app.selectbox(key=f"{key}-FDA").value, "Not submitted")
+        self.assertIsNone(self.app.selectbox(key=f"{key}-EU MDR").value)
+        self.assertIsNone(self.app.selectbox(key=f"{key}-EU AI Act").value)
+        self.assertTrue(any("status applies to the change plan for EU MDR" in node.value for node in self.app.markdown))
+        self.assertNotIn("ACC-020", adapter.get_algorithm(record)["answers"])
+        proposed.clear()
+        self.submit(f"d23-chat-input-{record}", "EU MDR: not submitted.")
+        self.click("Confirm suggestion")
+        result = adapter.get_algorithm(record)["answers"]["ACC-020"]
+        self.assertEqual(result["value"]["EU MDR"], "Not submitted")
+        self.assertIsNone(result["value"]["EU AI Act"])
+        self.assertTrue(any(node.value == "What is the change-plan status for EU AI Act?"
+                            for node in self.app.markdown))
+        self.submit(f"d23-chat-input-{record}", "EU AI Act: planned for submission.")
+        self.click("Confirm suggestion")
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-020"]["value"], {
+            "Health Canada": "Not submitted", "FDA": "Not submitted",
+            "EU MDR": "Not submitted", "EU AI Act": "Planned for submission",
+        })
+
+    def test_framework_filing_receipt_does_not_become_authorization(self):
+        self.mock_proposals("D2.3", {})
+        _, record = self.open_framework_status_question()
+        self.submit(f"d23-chat-input-{record}", "U.S. FDA: submission accepted for review.")
+        self.assertFalse(self.state.d23_conversations[record]["candidates"])
+        self.assertTrue(any("Available statuses:" in node.value for node in self.app.caption))
+        self.click("Edit this answer manually")
+        tools = next(node for node in self.app.expander if node.label == "Manage algorithms and answers")
+        self.assertTrue(tools.proto.expanded)
+
+    def test_affected_profile_reference_requires_confirmed_evidence(self):
+        proposed = {}
+        calls = self.mock_proposals("D2.3", proposed)
+        adapter, record = self.start_algorithm_at("ACC-013")
+        bridge = self.state.questionnaire_bridge
+        context = "Retinal screening in adults with diabetes"
+        bridge.save_answer("PIP-002", context)
+        adapter.save_answer(record, "ACC-013", "Yes")
+        self.app.run()
+        response = "Yes. The retinal screening population would expand to include adolescents."
+        proposed["ACC-017"] = {
+            "value": "Yes", "quote": response, "details": response,
+            "references": "PIP-002", "reference_evidence": {"PIP-002": context},
+        }
+        self.submit(f"d23-chat-input-{record}", response)
+        key = f"d23-review-{record}-2-ACC-017"
+        self.assertEqual(calls[-1]["confirmed_d21_answers"]["PIP-002"], context)
+        self.assertIn("Affected profile entries: PIP-002.", self.app.text_area(key=f"{key}-details").value)
+        self.assertNotIn("ACC-017", adapter.get_algorithm(record)["answers"])
+        self.click("Confirm suggestion")
+        self.assertIn("PIP-002", adapter.get_algorithm(record)["answers"]["ACC-017"]["details"])
+
     def test_component_details_use_original_message_and_keep_evidence_blank(self):
         proposed = {}
         calls = self.mock_proposals("D2.3", proposed)
@@ -265,7 +381,7 @@ class GuidedConversationTests(unittest.TestCase):
         self.submit(f"d23-chat-input-{record}", FUNCTION_DESCRIPTION)
         self.app.run()
         self.assertTrue(any("Your message is retained" in node.value for node in self.app.markdown))
-        self.assertTrue(any("Which confirmed D2.2 entries" in node.value for node in self.app.markdown))
+        self.assertTrue(any("Which confirmed AI-function entries" in node.value for node in self.app.markdown))
         self.assertEqual(self.state.d23_conversations[record]["turns"].count(FUNCTION_DESCRIPTION), 1)
 
     def test_exact_retinaguard_description_becomes_a_single_review_turn(self):
@@ -376,7 +492,7 @@ class GuidedConversationTests(unittest.TestCase):
         self.assertEqual(adapter.get_algorithm(first)["name"], "Retina Reader")
         self.assertEqual(adapter.get_algorithm(first)["version"], "2.5")
         self.assertEqual(adapter.get_algorithm(first)["answers"]["ACC-001"]["value"], "Retina Reader 2.5")
-        self.assertTrue(any("Which AI function(s)" in item.value for item in self.app.markdown))
+        self.assertTrue(any("Which of the AI functions" in item.value for item in self.app.markdown))
         self.assertFalse(any("AIF-004" in item.value for message in self.app.get("chat_message")
                              for item in message.get("markdown")))
         self.click("Skip for now")
