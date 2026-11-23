@@ -82,6 +82,16 @@ _CONFLICT_QUESTION = (
 )
 
 
+def d23_response_progress(adapter):
+    recorded = total = 0
+    for algorithm_id in adapter.algorithm_ids:
+        active = adapter.active_field_ids(algorithm_id)
+        answers = adapter.get_algorithm(algorithm_id)["answers"]
+        total += len(active)
+        recorded += sum(_complete(field, answers.get(field, {})) for field in active)
+    return recorded, total
+
+
 def d23_section_gaps():
     adapter = st.session_state.d23_adapter
     if not adapter.algorithm_ids:
@@ -550,7 +560,7 @@ def render_d23_history(*, exclude=None):
         _render_algorithm_turns(algorithm_id, conversations[algorithm_id])
 
 
-def render_d23_chat(*, continue_to_datasets=None):
+def render_d23_chat(*, tools, continue_to_datasets=None):
     state = st.session_state
     if "d23_adapter" not in state:
         state.d23_adapter = D23AnswerAdapter()
@@ -560,7 +570,6 @@ def render_d23_chat(*, continue_to_datasets=None):
 
     # Reserve the main conversation above the technical controls.
     chat = st.container()
-    tools = st.expander("Manage algorithms and answers", expanded=state.get("d23_show_manual", False))
     with tools:
         algorithm_id = _algorithm_tools(adapter, state)
 
@@ -568,21 +577,23 @@ def render_d23_chat(*, continue_to_datasets=None):
         render_d23_history(exclude=algorithm_id if not state.get("ux_d23_add") else None)
         if not algorithm_id and adapter.algorithm_ids and not state.get("ux_d23_add"):
             with st.chat_message("assistant"):
-                st.write("Which algorithm would you like to resume?")
-            for existing_id in adapter.algorithm_ids:
-                if st.button(f"Resume {_identity(adapter.get_algorithm(existing_id))}",
-                             key=f"ux-d23-resume-{existing_id}"):
-                    state["ux_select_algorithm"] = existing_id
+                st.write("Choose an algorithm to resume under Review & Edit.")
+            with tools:
+                for existing_id in adapter.algorithm_ids:
+                    if st.button(f"Resume {_identity(adapter.get_algorithm(existing_id))}",
+                                 key=f"ux-d23-resume-{existing_id}"):
+                        state["ux_select_algorithm"] = existing_id
+                        st.rerun()
+                if st.button("Add another algorithm", key="ux-d23-add-existing"):
+                    state.ux_d23_add = True
                     st.rerun()
-            if st.button("Add another algorithm", key="ux-d23-add-existing"):
-                state.ux_d23_add = True
-                st.rerun()
             return
         if not algorithm_id or state.get("ux_d23_add"):
-            if algorithm_id and st.button("Return to current algorithm", key="ux-d23-cancel-add"):
-                state.pop("ux_d23_add", None)
-                state.pop("ux_d23_proposal", None)
-                st.rerun()
+            with tools:
+                if algorithm_id and st.button("Return to current algorithm", key="ux-d23-cancel-add"):
+                    state.pop("ux_d23_add", None)
+                    state.pop("ux_d23_proposal", None)
+                    st.rerun()
             proposed = render_record_proposal(
                 "ux_d23_proposal", "Let's start by documenting your algorithm. What is its name and version?",
                 algorithm=True,
@@ -613,16 +624,7 @@ def render_d23_chat(*, continue_to_datasets=None):
     target = next((field for field in pending if field not in conversation["skipped"]), None)
     suggestions = _active_suggestions(adapter, algorithm_id, active, conversation)
 
-    with chat:
-        st.caption(f"Algorithm: {_identity(algorithm)}")
-        completed = len(active) - len(pending)
-        st.progress(completed / len(active), text=f"{completed}/{len(active)} applicable responses recorded")
-        findings = [item["message"] for item in adapter.build_record(algorithm_id)["flags"]
-                    if item["severity"] in {"blocking", "gap"}]
-        if findings:
-            with st.expander(f"Review regulatory findings ({len(findings)})"):
-                for finding in findings:
-                    st.write(finding)
+    with tools:
         if len(adapter.algorithm_ids) > 1:
             with st.popover("Switch algorithm"):
                 for other_id in adapter.algorithm_ids:
@@ -636,6 +638,8 @@ def render_d23_chat(*, continue_to_datasets=None):
             keep_record_drafts(conversations, algorithm_id, None, "d23-review-", "d23-answer-")
             state.ux_d23_add = True
             st.rerun()
+    with chat:
+        st.caption(f"Algorithm · {_identity(algorithm)}")
         _render_algorithm_turns(algorithm_id, conversation)
         detail_target = next((field for field, candidate in suggestions.items()
                               if _missing_details(field, candidate)), None)
@@ -707,31 +711,43 @@ def render_d23_chat(*, continue_to_datasets=None):
             if same_target and st.button("Edit this answer manually", key=f"d23-manual-{algorithm_id}-{target}"):
                 state.d23_show_manual = True
                 st.rerun()
-            _question_actions(adapter, algorithm_id, target, conversation)
+            with tools:
+                _question_actions(adapter, algorithm_id, target, conversation)
         elif adapter.build_record(algorithm_id)["validation_problems"]:
             with st.chat_message("assistant"):
-                st.write("This algorithm still has questions to resolve. Use the gap summary to resume.")
+                st.write("This algorithm still has questions to resolve. We can revisit missing details now, or you can review them later under Review & Edit.")
         else:
             with st.chat_message("assistant"):
                 if any(_unknown(answer["value"]) for answer in algorithm["answers"].values()) or _deployment_conflict(
                     {field: answer["value"] for field, answer in algorithm["answers"].items()}
                 ):
-                    st.write("The required responses are recorded. Documentation gaps remain in the summary below.")
+                    st.write("The required responses are recorded.")
                 else:
                     st.write(f"Required responses for {_identity(algorithm)} are recorded. This does not establish regulatory readiness.")
         ready_for_next = not suggestions and target is None and not conflict_target
         if ready_for_next:
             with st.chat_message("assistant"):
-                st.write("Do you need to document another algorithm? Say yes to add one, or no to move on to datasets.")
+                if d23_section_gaps()[0]:
+                    st.write("Some documentation gaps remain. You can review them now or return later.")
+                st.write("Do you need to document another algorithm? Say yes to add one, no to move on to datasets, "
+                         "or review gaps to revisit missing information.")
         message = st.chat_input(
             "Describe this algorithm or answer in your own words",
             key=f"d23-chat-input-{algorithm_id}", disabled=bool(suggestions) and detail_target is None,
         )
         if message and message.strip() and (not suggestions or detail_target):
             choice = message.strip().casefold().rstrip(".!")
+            if not suggestions and target and not conflict_target and choice in {"skip", "skip for now"}:
+                conversation["turns"].append(message)
+                if question:
+                    conversation.setdefault("questions", {})[str(len(conversation["turns"]))] = question
+                conversation["skipped"].add(target)
+                st.session_state.d23_answer_revision += 1
+                st.rerun()
             add_another = choice in {"yes", "yes, add another algorithm", "add another algorithm"}
             move_on = continue_to_datasets and choice in {"no", "no, continue", "no thanks", "continue to datasets"}
-            if ready_for_next and (add_another or move_on):
+            review_gaps = choice in {"review gaps", "review the gaps"}
+            if ready_for_next and (add_another or move_on or review_gaps):
                 conversation["turns"].append(message)
                 conversation.setdefault("questions", {})[str(len(conversation["turns"]))] = (
                     "Do you need to document another algorithm?"
@@ -739,11 +755,20 @@ def render_d23_chat(*, continue_to_datasets=None):
                 if add_another:
                     keep_record_drafts(conversations, algorithm_id, None, "d23-review-", "d23-answer-")
                     state.ux_d23_add = True
-                elif not d23_section_gaps()[0]:
+                elif move_on:
                     continue_to_datasets()
                 else:
-                    conversation["notice"] = "Review the remaining gaps below, then choose Continue with gaps to move on."
-                    conversation["notice_target"] = None
+                    gaps, resume_record = d23_section_gaps()
+                    if resume_record and adapter.build_record(resume_record)["validation_problems"]:
+                        resume_d23(resume_record)
+                    else:
+                        state.d23_show_manual = True
+                        conversation["notice"] = (
+                            "Open Review & Edit to see the recorded gaps. "
+                            "You can also describe any correction here."
+                            if gaps else "There are no unanswered requirements to revisit."
+                        )
+                        conversation["notice_target"] = None
                 st.rerun()
             _submit_turn(adapter, conversation, algorithm_id, current, message, question=question)
             st.rerun()

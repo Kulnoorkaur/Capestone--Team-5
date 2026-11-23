@@ -24,9 +24,9 @@ from app.chatbot.chat_llm import (
 )
 
 from app.chatbot.chat_navigation import render_section_footer
-from app.chatbot.d23_chat import d23_section_gaps, render_d23_chat, render_d23_history, resume_d23
+from app.chatbot.d23_chat import d23_response_progress, d23_section_gaps, render_d23_chat, render_d23_history, resume_d23
 from app.chatbot.d24_adapter import D24AnswerAdapter
-from app.chatbot.d24_chat import render_d24_chat
+from app.chatbot.d24_chat import d24_progress_status, render_d24_chat
 from app.chatbot.d24_metadata import D24CompatibilityError
 from app.chatbot.profile_io import (
     CombinedProfile,
@@ -494,6 +494,7 @@ def reset_application():
         "review_batch_version",
         "active_questionnaire",
         "d23_mode",
+        "d23_show_manual",
         "d23_adapter",
         "d23_active_algorithm_id",
         "d23_answer_revision",
@@ -713,43 +714,33 @@ def render_combined_profile_io():
 
 with st.sidebar:
 
-    st.title("Regulatory Profile")
-
-    confirmed = bridge.get_product_profile()
-
     st.subheader("Questionnaire Progress")
-    overall_completed = overall_total = 0
+    confirmed = bridge.get_product_profile()
     for questionnaire in QUESTIONNAIRES:
         progress = bridge.get_questionnaire_progress(questionnaire)
-        overall_completed += progress["completed"]
-        overall_total += progress["total"]
-        st.write(f"**{questionnaire} — {QUESTIONNAIRE_NAMES[questionnaire]}:** "
-                 f"{progress['completed']}/{progress['total']}")
-        conditional_fields = bridge.get_active_conditional_fields(questionnaire)
-        if conditional_fields:
-            conditional_completed = sum(fid in confirmed for fid in conditional_fields)
-            st.caption(f"Conditional: {conditional_completed}/{len(conditional_fields)}")
-    st.progress(overall_completed / overall_total if overall_total else 0)
-    st.caption(f"Overall primary questions: {overall_completed}/{overall_total}")
+        conditional = bridge.get_active_conditional_fields(questionnaire)
+        answered = progress["completed"] + sum(field in confirmed for field in conditional)
+        total = progress["total"] + len(conditional)
+        st.write(f"**{questionnaire} — {QUESTIONNAIRE_NAMES[questionnaire]}** · {answered}/{total} recorded")
 
-    st.divider()
+    algorithms = st.session_state.get("d23_adapter")
+    if algorithms and algorithms.algorithm_ids:
+        answered, total = d23_response_progress(algorithms)
+        algorithm_status = f"{answered}/{total} recorded"
+        if d23_section_gaps()[0]:
+            algorithm_status += " · gaps to review"
+    else:
+        algorithm_status = "Not started"
+    st.write(f"**D2.3 — Algorithm Change Control** · {algorithm_status}")
 
-    st.subheader("Additional Questionnaires")
+    datasets = st.session_state.get("d24_adapter")
+    dataset_status = d24_progress_status(datasets) if datasets else "Not started"
+    st.write(f"**D2.4 — Dataset and Evidence** · {dataset_status}")
+    st.write("**D2.5 — Risk Documentation** · Unavailable")
 
-    st.write(
-        "D2.3 — Algorithm Change Control: available after D2.2"
-    )
 
-    st.write(
-        "D2.4 — Dataset and Evidence: available from D2.3"
-    )
-
-    st.write(
-        "D2.5 — Risk Documentation: Not connected"
-    )
-
-    st.divider()
-
+def render_profile_controls():
+    confirmed = bridge.get_product_profile()
     if confirmed:
 
         st.download_button(
@@ -809,12 +800,10 @@ st.info(
 )
 
 
-chat_tab, manual_tab = st.tabs(
-    [
-        "Chat Buddy",
-        "Manual Questionnaire Editor",
-    ]
-)
+chat_tab = st.container()
+manual_tab = st.expander("Review & Edit", expanded=st.session_state.get("d23_show_manual", False))
+with manual_tab:
+    render_profile_controls()
 
 
 # ============================================================
@@ -1125,6 +1114,7 @@ def navigate_to(section):
     }
     state.update(drafts.pop(section, {}))
     state.ux_navigation_revision = state.get("ux_navigation_revision", 0) + 1
+    state.pop("d23_show_manual", None)
     state.d23_mode = section in ("D2.3", "D2.4")
     state.d24_mode = section == "D2.4"
     if section == "D2.3" or current in ("D2.3", "D2.4"):
@@ -1143,39 +1133,43 @@ with chat_tab:
         navigate_to("D2.3")
     navigation_revision = st.session_state.get("ux_navigation_revision", 0)
     if st.session_state.get("d24_mode", False):
-        if st.button("Back to D2.3", key=f"section-back-d24-{navigation_revision}"):
-            navigate_to("D2.3")
+        with manual_tab:
+            if st.button("Back to D2.3", key=f"section-back-d24-{navigation_revision}"):
+                navigate_to("D2.3")
         render_profile_transcript()
         render_d23_history()
-        render_d24_chat()
+        render_d24_chat(tools=manual_tab)
     elif st.session_state.get("d23_mode", False):
-        if st.button("Back to D2.1 and D2.2", key=f"section-back-d23-{navigation_revision}"):
-            navigate_to("D2.1/D2.2")
+        with manual_tab:
+            if st.button("Back to D2.1 and D2.2", key=f"section-back-d23-{navigation_revision}"):
+                navigate_to("D2.1/D2.2")
         render_profile_transcript()
         with st.chat_message("assistant"):
             st.write("Let’s document the algorithms that power your product’s AI functions and how changes are controlled.")
-        render_d23_chat(continue_to_datasets=lambda: navigate_to("D2.4"))
-        gaps, resume_record = d23_section_gaps()
-        revision = st.session_state.d23_answer_revision
-        active_id = st.session_state.get("d23_active_algorithm_id")
-        if render_section_footer(
-            "D2.3", gaps, next_section="D2.4", context=f"d23-{navigation_revision}-{active_id}-{revision}-{bool(gaps)}",
-            resume=lambda: resume_d23(resume_record),
-            resume_hint=f"Resume will open algorithm {resume_record}." if resume_record else "Add an algorithm to answer its questions.",
-        ):
-            navigate_to("D2.4")
+        render_d23_chat(tools=manual_tab, continue_to_datasets=lambda: navigate_to("D2.4"))
+        with manual_tab:
+            gaps, resume_record = d23_section_gaps()
+            revision = st.session_state.d23_answer_revision
+            active_id = st.session_state.get("d23_active_algorithm_id")
+            if render_section_footer(
+                "D2.3", gaps, next_section="D2.4",
+                context=f"d23-{navigation_revision}-{active_id}-{revision}-{bool(gaps)}",
+                resume=(lambda: resume_d23(resume_record)) if resume_record else None,
+                show_status=bool(st.session_state.d23_adapter.algorithm_ids),
+            ):
+                navigate_to("D2.4")
     else:
         render_d21_d22_chat()
         if st.session_state.intake_started or st.session_state.questionnaire_complete or bridge.answers:
             gaps = d21_d22_gaps()
-            if render_section_footer(
-                "D2.1 and D2.2", gaps, next_section="D2.3",
-                context=(f"d21-d22-{navigation_revision}-{st.session_state.asked_field}-"
-                         f"{st.session_state.editor_version}-{bool(gaps)}"),
-                resume=resume_d21_d22,
-                resume_hint="Resolve pending suggestions first." if st.session_state.field_suggestions else None,
-            ):
-                navigate_to("D2.3")
+            with manual_tab:
+                if render_section_footer(
+                    "D2.1 and D2.2", gaps, next_section="D2.3",
+                    context=(f"d21-d22-{navigation_revision}-{st.session_state.asked_field}-"
+                             f"{st.session_state.editor_version}-{bool(gaps)}"),
+                    resume=resume_d21_d22,
+                ):
+                    navigate_to("D2.3")
 
 
 # ============================================================
@@ -1183,7 +1177,6 @@ with chat_tab:
 # ============================================================
 
 with manual_tab:
-
     st.header("D2.1 and D2.2 Questionnaire Editor")
 
     st.caption(
@@ -1328,12 +1321,6 @@ with manual_tab:
 # CONFIRMED PROFILE
 # ============================================================
 
-st.divider()
-
-with st.expander(
-    "View Confirmed D2.1 and D2.2 Profile"
-):
-
-    st.json(
-        bridge.get_product_profile()
-    )
+with manual_tab:
+    with st.expander("View Confirmed D2.1 and D2.2 Profile"):
+        st.json(bridge.get_product_profile())

@@ -315,7 +315,7 @@ class GuidedConversationTests(unittest.TestCase):
         self.assertFalse(self.state.d23_conversations[record]["candidates"])
         self.assertTrue(any("Available statuses:" in node.value for node in self.app.caption))
         self.click("Edit this answer manually")
-        tools = next(node for node in self.app.expander if node.label == "Manage algorithms and answers")
+        tools = next(node for node in self.app.expander if node.label == "Review & Edit")
         self.assertTrue(tools.proto.expanded)
 
     def test_affected_profile_reference_requires_confirmed_evidence(self):
@@ -551,7 +551,7 @@ class GuidedConversationTests(unittest.TestCase):
         self.assertEqual(adapter.algorithm_ids, ())
         self.submit("ux_d23_proposal-message", "Our algorithm is called Retina Reader version 2.5.")
         self.assertEqual(adapter.algorithm_ids, ())
-        self.assertTrue(any(item.label == "Manage algorithms and answers" for item in self.app.expander))
+        self.assertTrue(any(item.label == "Review & Edit" for item in self.app.expander))
         self.click("Confirm algorithm record")
         first = adapter.algorithm_ids[0]
         self.assertEqual(adapter.get_algorithm(first)["name"], "Retina Reader")
@@ -596,7 +596,7 @@ class GuidedConversationTests(unittest.TestCase):
         adapter = self.state.d24_adapter
         self.submit("ux_d24_proposal_dataset-message", "The dataset is called Evaluation cohort 2025")
         self.assertEqual(adapter.record_ids("dataset"), ())
-        self.assertTrue(any(item.label == "Manage records and answers" for item in self.app.expander))
+        self.assertTrue(any(item.label == "Review & Edit" for item in self.app.expander))
         self.click("Confirm new record")
         first = adapter.record_ids("dataset")[0]
         self.assertEqual(adapter.get_answers(first), {"DEP-001.dataset_name_version": "Evaluation cohort 2025"})

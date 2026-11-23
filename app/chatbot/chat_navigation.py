@@ -5,17 +5,18 @@ import re
 import streamlit as st
 
 
-def render_section_footer(section, gaps, *, context, next_section=None, resume=None, resume_hint=None):
+def render_section_footer(section, gaps, *, context, next_section=None, resume=None, resume_hint=None, show_status=True):
     """Render the current status and return whether the user chose to advance."""
     state = st.session_state
     reviewing_gaps = state.get("ux_review_gaps_context") == context
     with st.container():
         if gaps:
-            with st.chat_message("assistant"):
-                st.write(f"{section} has unresolved questions or requirements.")
-            with st.expander("Review remaining gaps", expanded=reviewing_gaps):
-                for gap in gaps:
-                    st.write(f"- {gap}")
+            if show_status or reviewing_gaps:
+                if show_status:
+                    st.write(f"{section} has unresolved questions or requirements.")
+                with st.expander("Review remaining gaps", expanded=reviewing_gaps):
+                    for gap in gaps:
+                        st.write(f"- {gap}")
             if next_section:
                 if reviewing_gaps and st.button(
                     "Confirm continue with gaps", key=f"section-confirm-next-{context}",

@@ -70,6 +70,25 @@ class ChatNavigationTests(unittest.TestCase):
                 value = ["None"]
             adapter.save_answer(algorithm_id, field, value, details="Confirmed explanation", evidence="Document §1")
 
+    def test_sidebar_lists_all_sections_and_counts_applicable_responses(self):
+        self.fill_bridge("D2.1")
+        bridge = self.state.questionnaire_bridge
+        conditional = bridge.get_active_conditional_fields("D2.1")
+        adapter = D23AnswerAdapter()
+        algorithm = adapter.add_algorithm("Screening model")
+        adapter.save_answer(algorithm, "ACC-001", "Screening model")
+        self.state.d23_adapter = adapter
+        datasets = D24AnswerAdapter()
+        datasets.create_record("dataset")
+        self.state.d24_adapter = datasets
+        self.app.run()
+        rows = [item.value for item in self.app.sidebar.markdown]
+        self.assertEqual(len(rows), 5)
+        self.assertTrue(any(f"{24 + len(conditional)}/{24 + len(conditional)} recorded" in row for row in rows))
+        self.assertTrue(any("D2.3" in row and "1/" in row and "gaps to review" in row for row in rows))
+        self.assertTrue(any("D2.4" in row and "1 record" in row and "gaps" in row for row in rows))
+        self.assertTrue(any("D2.5" in row and "Unavailable" in row for row in rows))
+
     def test_documented_unknown_is_a_gap_without_reasking(self):
         adapter = D23AnswerAdapter()
         algorithm = adapter.add_algorithm("Screening model")
@@ -108,26 +127,31 @@ class ChatNavigationTests(unittest.TestCase):
         self.assert_footer("D2.1 and D2.2 complete", "Continue to D2.3", self.app.chat_input[0])
         self.click("Continue to D2.3")
         self.assertTrue(any("What is its name and version?" in item.value for item in self.app.markdown))
-        self.assert_footer("D2.3 has unresolved", "Continue with gaps", self.button("Add algorithm"))
-        gaps = next(item for item in self.app.expander if item.label == "Review remaining gaps")
-        self.assertFalse(gaps.proto.expanded)
+        self.assertFalse(any("D2.3 has unresolved" in item.value for item in self.app.markdown))
+        self.assertFalse(any(item.label == "Review remaining gaps" for item in self.app.expander))
+        panel = next(item for item in self.app.expander if item.label == "Review & Edit")
+        self.assertFalse(panel.proto.expanded)
+        for label in ("Add algorithm", "Continue with gaps", "Restore from JSON"):
+            self.assertTrue(any(getattr(item, "label", None) == label for item in panel))
         self.button("Continue with gaps").click().run()
         self.assertFalse(self.app.exception)
         self.assertTrue(self.state.d23_mode)
         gaps = next(item for item in self.app.expander if item.label == "Review remaining gaps")
         self.assertTrue(gaps.proto.expanded)
         self.click("Confirm continue with gaps")
-        self.assertTrue(any("Add a dataset to begin" in item.value for item in self.app.caption))
+        self.assertTrue(any("What dataset would you like to start with?" in item.value for item in self.app.markdown))
 
     def test_completed_algorithm_can_move_to_datasets_in_chat(self):
         adapter = D23AnswerAdapter()
         algorithm = adapter.add_algorithm("Screening model")
         self.fill_algorithm(adapter, algorithm)
+        adapter.save_answer(algorithm, "ACC-021", "Unknown", details="Waiting for the procedure record.")
         self.state.d23_adapter = adapter
         self.state.d23_mode = True
         self.state.d23_answer_revision = 0
         self.state.d23_active_algorithm_id = algorithm
         self.app.run()
+        self.assertTrue(any("Some documentation gaps remain" in node.value for node in self.app.markdown))
         self.assertTrue(any("Do you need to document another algorithm?" in item.value for item in self.app.markdown))
         self.app.chat_input(key=f"d23-chat-input-{algorithm}").set_value("Yes.").run()
         self.assertFalse(self.app.exception)
@@ -139,6 +163,26 @@ class ChatNavigationTests(unittest.TestCase):
         self.assertFalse(self.app.exception)
         self.assertTrue(self.state.d24_mode)
         self.assertTrue(any(item.value == "No." for item in self.app.text))
+
+    def test_dataset_boundary_accepts_chat_navigation_and_keeps_previous_turns(self):
+        adapter = D24AnswerAdapter()
+        record = adapter.create_record("dataset")
+        adapter.save_answer(record, "DEP-001.dataset_name_version", "Validation cohort")
+        self.state.d24_adapter = adapter
+        self.state.d23_mode = True
+        self.state.d24_mode = True
+        self.state.d24_conversations = {
+            record: {"turns": ["Previous dataset detail."], "pending": {}, "notice": "",
+                     "skipped": set(adapter.active_fields(record))},
+        }
+        self.app.run()
+        self.assertFalse(self.app.exception)
+        self.assertTrue(any("Do you need to document another dataset?" in node.value for node in self.app.markdown))
+        self.app.chat_input(key=f"d24-message-{record}").set_value("No.").run()
+        self.assertFalse(self.app.exception)
+        self.assertEqual(self.state.d24_active_scope, "function")
+        self.assertTrue(any(node.value == "Previous dataset detail." for node in self.app.text))
+        self.assertTrue(any(node.value.startswith("Do you need to document another dataset?") for node in self.app.text))
 
     def test_algorithm_completion_is_section_wide_and_stale_navigation_is_ignored(self):
         adapter = D23AnswerAdapter()
@@ -155,7 +199,8 @@ class ChatNavigationTests(unittest.TestCase):
         self.assertEqual(self.state.d23_active_algorithm_id, second)
         self.fill_algorithm(adapter, second)
         self.app.run()
-        self.assert_footer("D2.3 complete", "Continue to D2.4", self.app.chat_input[0])
+        panel = next(item for item in self.app.expander if item.label == "Review & Edit")
+        self.assertTrue(any(getattr(item, "label", None) == "Continue to D2.4" for item in panel))
         stale = self.button("Continue to D2.4")
         stale.click()
         self.click("Back to D2.1 and D2.2")

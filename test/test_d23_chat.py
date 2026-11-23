@@ -244,7 +244,7 @@ class D23ChatTests(unittest.TestCase):
             self.click("Confirm D2.3 answer")
 
         self.assertEqual(len(adapter.get_algorithm(algorithm_id)["answers"]), 29)
-        self.assertTrue(any("29/29 applicable responses recorded" in item.proto.text for item in self.app.get("progress")))
+        self.assertTrue(any("29/29 recorded" in item.value for item in self.app.sidebar.markdown))
         self.assertTrue(any("Supporting information remains unresolved" in item.value for item in self.app.markdown))
         confirmed = adapter.get_algorithm(algorithm_id)["answers"]
         self.assertEqual(confirmed["ACC-005"], {

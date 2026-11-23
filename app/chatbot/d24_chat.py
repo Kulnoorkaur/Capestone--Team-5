@@ -69,7 +69,7 @@ def _reconcile_suggestions(adapter, record_id, conversation):
     conversation["pending"] = {field_id: pending[field_id] for field_id in reachable}
 
 
-def _render_extraction(adapter, record_id, scope, target, conversation):
+def _render_extraction(adapter, record_id, scope, target, conversation, *, boundary=False, question=None):
     if conversation["pending"]:
         st.caption("A new message replaces unconfirmed suggestions for this record.")
     message = st.chat_input(
@@ -78,6 +78,31 @@ def _render_extraction(adapter, record_id, scope, target, conversation):
     )
     if not message:
         return
+    if question:
+        conversation.setdefault("questions", {})[str(len(conversation["turns"]) + 1)] = question
+    choice = message.strip().casefold().rstrip(".!")
+    if target and not conversation["pending"] and choice in {"skip", "skip for now"}:
+        conversation["turns"].append(message)
+        conversation["skipped"].add(target)
+        st.rerun()
+    if boundary:
+        state = st.session_state
+        scopes = (*_RECORDS, adapter.GMLP)
+        index = scopes.index(scope)
+        if choice in {"yes", "add another"} and scope != adapter.GMLP:
+            conversation["turns"].append(message)
+            keep_record_drafts(state.d24_conversations, record_id, None, "d24-review-", "d24-answer-")
+            state.ux_d24_add = scope
+            st.rerun()
+        if choice in {"no", "continue", "next"} and index + 1 < len(scopes):
+            conversation["turns"].append(message)
+            state["ux_resume_dataset"] = (scopes[index + 1], None, None)
+            st.rerun()
+        if choice in {"review gaps", "review the gaps"}:
+            conversation["turns"].append(message)
+            state["ux_resume_dataset"] = _resume_target(adapter, scope, record_id)
+            state.d23_show_manual = True
+            st.rerun()
     _submit_record_turn(adapter, record_id, scope, target, conversation, message)
     st.rerun()
 
@@ -211,6 +236,31 @@ def _question_actions(adapter, record_id, field_id, field, conversation, revisio
             st.rerun()
 
 
+def _render_record_turns(record_id, conversation):
+    introduction = st.session_state.get("ux_d24_introductions", {}).get(record_id)
+    if introduction:
+        with st.chat_message("user"):
+            st.text(introduction)
+    questions = conversation.get("questions", {})
+    for turn, message in enumerate(conversation["turns"], 1):
+        if question := questions.get(str(turn)):
+            with st.chat_message("assistant"):
+                st.text(question)
+        with st.chat_message("user"):
+            st.text(message)
+
+
+def d24_progress_status(adapter):
+    records = [record for scope in _RECORDS for record in adapter.record_ids(scope)]
+    if not records and not adapter.get_answers(adapter.GMLP):
+        return "Not started"
+    gaps = _required_findings(adapter.validate())
+    record_count = f"{len(records)} {'record' if len(records) == 1 else 'records'}"
+    if not gaps:
+        return f"{record_count} · required details recorded"
+    return f"{record_count} · {len(gaps)} {'gap' if len(gaps) == 1 else 'gaps'}"
+
+
 def _render_record(adapter, record_id, scope, tools):
     active = adapter.active_fields(record_id)
     answers = adapter.get_answers(record_id)
@@ -225,38 +275,41 @@ def _render_record(adapter, record_id, scope, tools):
         target = "DEP-036-trigger"
 
     label, name_field = _RECORDS.get(scope, ("Profile-wide GMLP", None))
-    st.caption(f"{answers.get(name_field, label)} · {len(answers)} confirmed · {len(required)} validation gaps")
-    introduction = st.session_state.get("ux_d24_introductions", {}).get(record_id)
-    for message in ([introduction] if introduction else []) + conversation["turns"]:
-        with st.chat_message("user"):
-            st.text(message)
+    st.caption(answers.get(name_field, label))
+    _render_record_turns(record_id, conversation)
     same_target = target is not None and conversation.get("notice_target") == target
     if conversation["notice"] and (same_target or conversation.get("notice_target") is None):
         with st.chat_message("assistant"):
             st.info(conversation["notice"])
     _reconcile_suggestions(adapter, record_id, conversation)
     reviewing = any(field_id in active for field_id in conversation["pending"])
+    question = None
     if reviewing:
         _render_suggestions(adapter, record_id, active, revision, conversation)
     elif target:
         with st.chat_message("assistant"):
             question = conversational_question(active[target].prompt)
             if same_target:
-                st.write(f"To continue, please clarify this detail for the selected record. {question}")
-            else:
-                st.write(question)
-        _question_actions(adapter, record_id, target, active[target], conversation, revision)
+                question = f"To continue, please clarify this detail for the selected record. {question}"
+            st.write(question)
+        with tools:
+            _question_actions(adapter, record_id, target, active[target], conversation, revision)
     elif required:
         with st.chat_message("assistant"):
-            st.write("This record has unresolved information. Resume unanswered questions or review the technical controls.")
+            st.write("Some details are still missing. Say review gaps to revisit them, or review them later under Review & Edit.")
     else:
         with st.chat_message("assistant"):
             st.write(f"Required answers for this {label.lower()} are complete.")
-    if skipped:
-        st.caption(f"{len(skipped)} deferred questions for this record.")
-    _render_extraction(adapter, record_id, scope, target, conversation)
+    boundary = not reviewing and target is None
+    if boundary and scope != adapter.GMLP:
+        question = f"Do you need to document another {label.lower()}? Say yes to add one or no to move on."
+        with st.chat_message("assistant"):
+            st.write(question)
+    _render_extraction(adapter, record_id, scope, target, conversation, boundary=boundary, question=question)
 
     with tools:
+        if skipped:
+            st.caption(f"{len(skipped)} deferred questions for this record.")
         _manual_record_answers(adapter, record_id, active, answers, conversation, findings, target)
     return not reviewing and target is None
 
@@ -319,9 +372,8 @@ def _render_scope_actions(adapter, kind, record_id, labels, at_boundary):
                 st.rerun()
 
 
-def render_d24_chat():
+def render_d24_chat(*, tools):
     state = st.session_state
-    st.subheader("D2.4 — Dataset and Evidence")
     try:
         if "d24_adapter" not in state:
             state.d24_adapter = D24AnswerAdapter()
@@ -353,7 +405,6 @@ def render_d24_chat():
                     state[f"d24-question-{identity}-{revision}"] = field
 
     chat = st.container()
-    tools = st.expander("Manage records and answers", expanded=False)
     previous_id = adapter.selected_record_id
     with tools:
         kind = st.radio("Dataset and evidence section", tuple(labels), format_func=labels.get, key="d24-section")
@@ -365,13 +416,17 @@ def render_d24_chat():
             record_id = _select_record(adapter, kind)
 
     with chat:
+        for identity, conversation in conversations.items():
+            if identity != record_id or state.get("ux_d24_add") == kind:
+                _render_record_turns(identity, conversation)
         if kind != adapter.GMLP and (record_id is None or state.get("ux_d24_add") == kind):
             if record_id is None:
                 keep_record_drafts(conversations, previous_id, None, "d24-review-", "d24-answer-")
-            if record_id and st.button("Return to current record", key=f"ux-d24-cancel-{kind}"):
-                state.pop("ux_d24_add", None)
-                state.pop(f"ux_d24_proposal_{kind}", None)
-                st.rerun()
+            with tools:
+                if record_id and st.button("Return to current record", key=f"ux-d24-cancel-{kind}"):
+                    state.pop("ux_d24_add", None)
+                    state.pop(f"ux_d24_proposal_{kind}", None)
+                    st.rerun()
             question = (
                 "Now let's document the datasets and evidence supporting your AI system. "
                 "What dataset would you like to start with?"
@@ -391,22 +446,16 @@ def render_d24_chat():
                 )
                 _submit_record_turn(adapter, new_id, kind, target, conversation, introduction, initial=True)
                 st.rerun()
-            if record_id is None:
-                st.caption(f"Add a {labels[kind].lower()} to begin.")
             at_boundary = record_id is None
         else:
             keep_record_drafts(conversations, previous_id, record_id, "d24-review-", "d24-answer-")
             at_boundary = _render_record(adapter, record_id, kind, tools)
+    with tools:
         _render_scope_actions(adapter, kind, record_id, labels, at_boundary)
-
-    gaps = _required_findings(adapter.validate())
-    target = _resume_target(adapter, kind, record_id) if gaps else None
-    hint = None
-    if target:
-        scope, identity, _ = target
-        hint = f"Resume will open {labels[scope]}" + (f" ({identity})." if identity else " setup.")
-    render_section_footer(
-        "D2.4", [f"{issue['record']} · {issue['issue']}" for issue in gaps],
-        context=f"d24-{state.get('ux_navigation_revision', 0)}-{kind}-{record_id}-{state.d24_revisions.get(record_id, 0)}",
-        resume=lambda: state.update(ux_resume_dataset=target), resume_hint=hint,
-    )
+        gaps = _required_findings(adapter.validate())
+        target = _resume_target(adapter, kind, record_id) if gaps else None
+        render_section_footer(
+            "D2.4", [f"{issue['record']} · {issue['issue']}" for issue in gaps],
+            context=f"d24-{state.get('ux_navigation_revision', 0)}-{kind}-{record_id}-{state.d24_revisions.get(record_id, 0)}",
+            resume=(lambda: state.update(ux_resume_dataset=target)) if target else None,
+        )
