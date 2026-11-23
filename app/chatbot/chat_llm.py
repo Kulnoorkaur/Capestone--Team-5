@@ -568,6 +568,33 @@ def _d23_reference_supported(value, quote, evidence, confirmed_answers, *, prefi
     return True
 
 
+def _d23_confirmed_output_quote(message, outputs):
+    """Ground the output reference in an explicit action and a confirmed output."""
+    if not isinstance(outputs, list):
+        return ""
+    patterns = []
+    if "Label" in outputs:
+        patterns.append(r"(?:screening|diagnostic) classifications?(?: labels?)?|(?:classification|screening|diagnostic) labels?")
+    if "Score" in outputs:
+        patterns.append(r"(?:risk|screening)[ -]scores?")
+    if not patterns:
+        return ""
+    for sentence in re.split(r"(?<=[.!?])\s+|\n", message):
+        if sentence.endswith("?") or re.search(
+            r"\b(?:not|never|no|may|might|could|would|will|if|plans?|planned|proposed|future|"
+            r"other (?:algorithm|model)|instead)\b|n['’]t\b", sentence, re.I,
+        ):
+            continue
+        match = re.search(
+            rf"\b(?:generat(?:e|es|ing)|output(?:s|ting)?|produc(?:e|es|ing)|return(?:s|ing)?)\s+"
+            rf"(?:an?\s+|the\s+)?(?:{'|'.join(patterns)})\b",
+            sentence, re.I,
+        )
+        if match:
+            return match[0]
+    return ""
+
+
 def _d23_function_matches(matches, source, confirmed_answers):
     """Validate each proposed association independently against both actual answers."""
     if not isinstance(matches, dict):
@@ -768,7 +795,13 @@ clarification rather than selecting it. In details, return exact excerpts
 explaining the roles, not just the reference IDs.
 For all fields, put relevant exact supporting excerpts in details even when
 the owner does not require an explanation. For architecture, capture the
-model family and any supplied description of how it is used.
+model family and any supplied description of how it is used. A CNN does not
+establish supervised learning. Do not infer a training method from architecture,
+deployment behavior, or output types. Suggest Supervised only for explicit
+supervised training or a description of training the model on labeled data. For AIF-006,
+check output types separately from preprocessing and classification processing:
+a stated screening classification label can support a confirmed Label option.
+Do not equate a risk score with a probability unless the user explicitly does.
 For ACC-017, use references (a comma-separated string) and reference_evidence
 in the same way for affected confirmed D2.1/D2.2 answers. Include exact
 supporting wording about the change in details. Never invent a reference.
@@ -829,6 +862,21 @@ and pending conformity assessment does not imply review of the change plan.
                 value = options.get(value.strip().casefold(), value)
             elif isinstance(value, list) and all(isinstance(item, str) for item in value):
                 value = [options.get(item.strip().casefold(), item) for item in value]
+        if field_id == "ACC-003" and isinstance(value, list) and "Supervised" in value:
+            words = quote.casefold()
+            supervised = re.search(
+                r"(?<!un)\bsupervised (?:learning|training)\b|"
+                r"\b(?:train(?:s|ed|ing)?|learn(?:s|ed|ing)?)\b[^.!?]*?\b(?:on|with|using|uses)\s+"
+                r"(?:labeled|labelled|annotated)(?: \w+){0,2} (?:data|images|photographs|examples|samples|records)\b",
+                words,
+            )
+            explicit_answer = target_field == field_id and words.strip(" .!") == "supervised"
+            if not (supervised or explicit_answer) or re.search(
+                r"\b(?:not|never|no|may|might|would|will|plans?)\b|n['’]t\b", words,
+            ):
+                value = [option for option in value if option != "Supervised"]
+                if not value:
+                    continue
         if not _d23_has_direct_basis(field_id, value, quote):
             blocked_target |= field_id == target_field
             continue
@@ -890,6 +938,41 @@ and pending conformity assessment does not imply review of the change plan.
         missing_detail = proposed.get("missing_detail")
         if needs_details(field_id, value) and isinstance(missing_detail, str) and missing_detail.strip():
             suggestions[field_id]["missing_detail"] = missing_detail.strip()[:300]
+    if target_field == "ACC-002" and target and not other_mentions and not detail_followup:
+        output_quote = _d23_confirmed_output_quote(message, d22_answers.get("AIF-006"))
+        association = suggestions.get("ACC-002")
+        # The model occasionally joins two real excerpts with an ellipsis. Use
+        # individually verified fragments, never the edited quotation itself.
+        proposed_match = candidates.get("ACC-002")
+        proposed_matches = proposed_match.get("reference_matches") if isinstance(proposed_match, dict) else None
+        recovered = {}
+        if isinstance(proposed_matches, dict):
+            for reference, evidence in proposed_matches.items():
+                match_quote = evidence.get("quote") if isinstance(evidence, dict) else None
+                if not isinstance(match_quote, str) or "..." not in match_quote:
+                    continue
+                parts = [part.strip() for part in match_quote.split("...")]
+                if all(_quoted_in(part, message) for part in parts):
+                    for part in parts:
+                        recovered.update(_d23_function_matches(
+                            {reference: {**evidence, "quote": part}}, message, d22_answers,
+                        ))
+                        if reference in recovered:
+                            break
+        if output_quote:
+            recovered.setdefault("AIF-006", output_quote)
+        for reference, quote in recovered.items():
+            if association is None:
+                association = suggestions["ACC-002"] = {
+                    "algorithm_id": algorithm_id, "field_id": "ACC-002", "source_id": source_id,
+                    "quote": quote, "value": reference, "details": quote,
+                    "reference_quotes": {reference: quote}, "correction": correction,
+                }
+            elif reference not in association["value"].split(", "):
+                association["value"] = ", ".join(sorted([*association["value"].split(", "), reference]))
+                if quote not in association["details"]:
+                    association["details"] = " ".join(filter(None, (association["details"], quote)))
+                association.setdefault("reference_quotes", {})[reference] = quote
     if target_field == "ACC-020" and target and not other_mentions and not detail_followup:
         value, mentioned = _d23_framework_statuses(message)
         proposed_status = suggestions.pop(target_field, {})

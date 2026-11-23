@@ -137,7 +137,7 @@ class GuidedConversationTests(unittest.TestCase):
         self.assertTrue(bridge.save_answer("AIF-007", ["Dashboard"])[0])
         proposed = {}
         calls = self.mock_proposals("D2.3", proposed)
-        self.submit("ux_d23_proposal-message", RETINAGUARD)
+        self.submit("ux_d23_proposal-message", "RetinaGuard DR Detection Algorithm, Version 1.0.")
         self.click("Confirm algorithm record")
         adapter = self.state.d23_adapter
         record = adapter.algorithm_ids[0]
@@ -165,6 +165,49 @@ class GuidedConversationTests(unittest.TestCase):
         self.assertTrue(any("Why this fits your description" in node.value for node in self.app.caption))
         self.app.button(key=f"d23-review-{record}-2-ACC-002-confirm").click().run()
         self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-002"]["value"], "AIF-004, AIF-006")
+
+    def test_missed_label_association_is_recovered_without_inventing_training(self):
+        bridge = self.state.questionnaire_bridge
+        preprocessing = "It performs retinal image preprocessing."
+        self.assertTrue(bridge.save_answer("AIF-004", preprocessing)[0])
+        self.assertTrue(bridge.save_answer("AIF-006", ["Label", "Probability", "Alert"])[0])
+        self.assertTrue(bridge.save_answer("AIF-007", ["Dashboard"])[0])
+        proposed = {}
+        self.mock_proposals("D2.3", proposed)
+        adapter, record = self.start_algorithm_at("ACC-002")
+        architecture = "It uses a convolutional neural network to analyze retinal photographs."
+        output = "It generates screening classifications and risk scores."
+        proposed.update({
+            "ACC-002": {
+                "value": "AIF-004", "quote": preprocessing,
+                "reference_matches": {
+                    "AIF-004": {"quote": f"{preprocessing}... {architecture}", "confirmed_excerpt": preprocessing},
+                },
+            },
+            "ACC-003": {"value": ["Supervised"], "quote": architecture},
+            "ACC-004": {"value": ["CNN"], "quote": architecture},
+        })
+        self.submit(f"d23-chat-input-{record}", f"{preprocessing} {architecture} {output}")
+        candidates = self.state.d23_conversations[record]["candidates"]
+        expected = "AIF-004, AIF-006"
+        self.assertEqual(candidates["ACC-002"]["value"], expected)
+        self.assertIn("generates screening classifications", candidates["ACC-002"]["details"])
+        self.assertNotIn("risk scores", candidates["ACC-002"]["reference_quotes"]["AIF-006"])
+        self.assertNotIn("ACC-003", candidates)
+        self.assertEqual(candidates["ACC-004"]["details"], architecture)
+        self.assertNotIn("ACC-002", adapter.get_algorithm(record)["answers"])
+        self.app.button(key=f"d23-review-{record}-2-ACC-002-confirm").click().run()
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-002"]["value"], expected)
+
+    def test_output_reference_requires_current_affirmative_confirmed_role(self):
+        for message in (
+            "It generates risk scores.",
+            "It does not generate screening classifications.",
+            "It will generate screening classifications.",
+            "It generates screening classifications?",
+        ):
+            with self.subTest(message=message):
+                self.assertEqual(chat_llm._d23_confirmed_output_quote(message, ["Label", "Probability", "Alert"]), "")
 
     def start_algorithm_at(self, target):
         self.submit("ux_d23_proposal-message", RETINAGUARD)
