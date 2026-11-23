@@ -66,7 +66,26 @@ class ChatNavigationTests(unittest.TestCase):
                 value = options[0]
             else:
                 value = "AIF-001" if field == "ACC-002" else "Confirmed example"
+            if field == "ACC-009":
+                value = ["None"]
             adapter.save_answer(algorithm_id, field, value, details="Confirmed explanation", evidence="Document §1")
+
+    def test_documented_unknown_is_a_gap_without_reasking(self):
+        adapter = D23AnswerAdapter()
+        algorithm = adapter.add_algorithm("Screening model")
+        self.fill_algorithm(adapter, algorithm)
+        adapter.save_answer(algorithm, "ACC-021", "Unknown", details="The procedure record is unavailable.")
+        self.assertFalse(adapter.build_record(algorithm)["validation_problems"])
+        self.state.d23_adapter = adapter
+        self.state.d23_mode = True
+        self.state.d23_active_algorithm_id = algorithm
+        self.state.d23_answer_revision = 0
+        self.app.run()
+        self.assertFalse(self.app.exception)
+        self.assertTrue(any("Supporting information remains unresolved" in item.value for item in self.app.markdown))
+        self.assertTrue(any("required responses are recorded" in item.value for item in self.app.markdown))
+        self.assertFalse(any(item.label == "Continue to D2.4" for item in self.app.button))
+        self.assertFalse(any(item.label == "Skip for now" for item in self.app.button))
 
     def test_automatic_d22_and_completed_footer_then_record_entry(self):
         self.fill_bridge("D2.1")

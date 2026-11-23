@@ -448,11 +448,70 @@ def _request_extraction(prompt, system_instruction, max_attempts):
     return extracted
 
 
+_D23_UNCERTAINTY = re.compile(
+    r"\b(?:unknown|(?:do not|don't|cannot|can't) know|not sure|unsure|information (?:is )?unavailable|"
+    r"(?:cannot|can't) (?:confirm|provide)|not (?:yet )?known|"
+    r"(?:records?|information) (?:is |are )?not (?:yet )?available)\b", re.I,
+)
+_D23_NOT_RELEASED = re.compile(
+    r"\b(?:not (?:yet |previously )?released|never (?:been )?released|"
+    r"(?:hasn't|haven't|has not|have not) (?:been )?released|no (?:prior |previous |first )?release)\b", re.I,
+)
+_D23_CLARIFICATIONS = {
+    "ACC-019": "Is there already a documented change plan that lists planned changes and how each will be verified?",
+    "ACC-021": "Is the change-control process already documented in an approved procedure, or is it still being developed? "
+               "If it is documented, what are the procedure ID and version?",
+    "ACC-023": "Which verification or validation activities have been performed before release? "
+               "If they are still planned, please say so.",
+    "ACC-029": "Has this algorithm been released before? If it has, which changes were actually made "
+               "since the first release or last authorization?",
+}
+
+
 def _d23_has_direct_basis(field_id, value, quote):
     """Filter a few high-risk misreadings of otherwise verbatim evidence."""
     from app.deliverable_2.questionnaires.algorithm_change_control import ADAPTIVE
 
     words = quote.casefold()
+    selections = value.values() if isinstance(value, dict) else value if isinstance(value, list) else (value,)
+    if "Unknown" in selections and not _D23_UNCERTAINTY.search(quote):
+        return False
+    if field_id == "ACC-019" and value in ("Yes", "Partly"):
+        if not re.search(r"\b(?:pccp|change[- ]control plan|change plan|documented plan)\b", words):
+            return False
+        if re.search(r"\b(?:will (?:write|develop|draft|document)|plan to (?:write|develop|draft|document)|"
+                     r"not (?:yet )?documented|no documented plan)\b", words):
+            return False
+    if field_id == "ACC-021" and value in ("Yes", "Partly", "No") and words.strip(" .!?") != value.casefold():
+        if not re.search(r"\b(?:procedure|sop)\b", words):
+            return False
+        if value in ("Yes", "Partly") and not re.search(
+            r"\b(?:already documented|is documented|approved|documented procedure|"
+            r"(?:we|the manufacturer) (?:have|use|follow)|procedure (?:exists|is in effect)|sop[- ]?\d)\b", words,
+        ):
+            return False
+        if value in ("Yes", "Partly") and re.search(
+            r"\b(?:not (?:yet )?(?:documented|approved)|no (?:documented |approved )?procedure|"
+            r"will (?:write|draft|document|approve|develop|be approved)|(?:still |under |in )development|"
+            r"plan(?:s)? to (?:write|draft|document|develop))\b", words,
+        ):
+            return False
+        if value == "No" and not re.search(
+            r"\b(?:no (?:approved |documented )?procedure|not (?:yet )?(?:documented|approved)|"
+            r"procedure (?:is |still )?(?:being developed|in development))\b", words,
+        ):
+            return False
+    if field_id == "ACC-029":
+        if value == "Not applicable (not previously released)":
+            return bool(_D23_NOT_RELEASED.search(quote))
+        if value == "None":
+            return bool(re.search(r"\b(?:no changes|nothing has changed|unchanged)\b", words)
+                        and not _D23_NOT_RELEASED.search(quote))
+        if value == "Changes have been made since last release":
+            return bool(re.search(r"\b(?:released|deployed|implemented|updated|modified|changed|retrained|"
+                                  r"changes (?:were|have been) made)\b", words)
+                        and re.search(r"\b(?:since|after|in version|in release|on \d)\b", words)
+                        and not re.search(r"\b(?:will|planned|plan to|would|proposed|not (?:yet )?released)\b", words))
     if field_id == "ACC-008" and value == ADAPTIVE:
         if "offline" in words and not re.search(r"\badaptive\b|\blearns? in the field\b", words):
             return False
@@ -466,7 +525,7 @@ def _d23_has_direct_basis(field_id, value, quote):
         ):
             return False
     if field_id == "ACC-023" and re.search(
-        r"\b(?:plans? to|will|intends? to) (?:run|test|verify|validate|perform)\b",
+        r"\b(?:plans? to|will|intends? to) (?:run|test|verify|validate|perform|conduct|complete|undergo)\b",
         words,
     ):
         if not re.search(r"\b(?:ran|performed|completed|verified|validated|tested)\b", words):
@@ -584,7 +643,7 @@ def extract_d23_candidates(
     """Extract quoted candidates for a single algorithm. Do not save answers."""
     from app.deliverable_2.questionnaires.algorithm_change_control import FIELDS, FRAMEWORKS, needs_details
 
-    correction = bool(_EXPLICIT_CORRECTION.match(message))
+    correction = bool(_EXPLICIT_CORRECTION.match(message) or re.match(r"^\s*actually\b", message, re.I))
     confirmed = algorithm["answers"]
     fields = {
         field["id"]: {
@@ -630,6 +689,15 @@ object with only explicitly supported framework statuses. Prioritize the
 target field when the user answers it. If a statement is ambiguous or asks for
 clarification, omit ambiguous candidates and return a brief clarification.
 Only a clearly labeled correction can produce a proposal for a confirmed field.
+For each field, verify that the quotation answers the actual question; related
+context alone is not evidence. Unknown requires an explicit statement that the
+user cannot provide that answer. Ask about a missing fact instead of mapping
+an off-topic or incomplete response to Unknown. Use separate excerpts for
+separate claims. Do not reuse general statements as explanations.
+Manufacturer-controlled retraining between releases is compatible with a locked
+deployed model. Future reviews and approval steps do not establish that an
+approved documented procedure already exists. Report completed modifications
+since release separately from planned changes. Do not infer verified evidence.
 
 Offline retraining and manufacturer releases do not imply deployed adaptive
 behavior. Configurable thresholds do not imply model-weight changes. A planned
@@ -698,6 +766,7 @@ and pending conformity assessment does not imply review of the change plan.
     if not other_mentions and not detail_followup and target.get("active"):
         direct = _d23_direct_reply(message, target.get("options", ()))
 
+    blocked_target = False
     for field_id, proposed in candidates.items():
         if field_id not in fields or not isinstance(proposed, dict) or "value" not in proposed:
             continue
@@ -728,6 +797,7 @@ and pending conformity assessment does not imply review of the change plan.
             elif isinstance(value, list) and all(isinstance(item, str) for item in value):
                 value = [options.get(item.strip().casefold(), item) for item in value]
         if not _d23_has_direct_basis(field_id, value, quote):
+            blocked_target |= field_id == target_field
             continue
         if field_id == "ACC-002" and not _d23_reference_supported(
             value, quote, proposed.get("reference_evidence"), d22_answers,
@@ -738,7 +808,7 @@ and pending conformity assessment does not imply review of the change plan.
         if not details and field_id == target_field and direct and value == direct[0]:
             details = direct[2]
         if (not details and not (proposed.get("details") or proposed.get("explanation"))
-                and fields[field_id]["type"] in {"select", "multiselect"}):
+                and field_id == target_field and fields[field_id]["type"] in {"select", "multiselect"}):
             selections = [value] if isinstance(value, str) else value
             if isinstance(selections, list) and all(isinstance(item, str) for item in selections):
                 if len(quote.split()) >= 5 and quote.strip(" .!?") not in selections:
@@ -779,6 +849,22 @@ and pending conformity assessment does not imply review of the change plan.
                 "algorithm_id": algorithm_id, "field_id": target_field, "source_id": source_id,
                 "quote": message, "value": release_only, "details": message, "correction": correction,
             }
+    if (not other_mentions and "ACC-029" in fields and (target_field == "ACC-029" or correction)
+            and "?" not in message and _D23_NOT_RELEASED.search(message)):
+        suggestions["ACC-029"] = {
+            "algorithm_id": algorithm_id, "field_id": "ACC-029", "source_id": source_id,
+            "quote": message, "value": "Not applicable (not previously released)",
+            "details": message, "correction": correction,
+        }
+    if (target and not other_mentions and not detail_followup and target_field not in suggestions
+            and "Unknown" in target["options"] and _D23_UNCERTAINTY.search(message) and "?" not in message
+            and target["type"] in {"select", "multiselect"}):
+        suggestions[target_field] = {
+            "algorithm_id": algorithm_id, "field_id": target_field, "source_id": source_id,
+            "quote": message, "value": ["Unknown"] if target["type"] == "multiselect" else "Unknown",
+            "details": "" if _D23_UNCERTAINTY.fullmatch(message.strip(" .!?")) else message,
+            "correction": correction,
+        }
     if direct and target_field not in suggestions and not result.get("clarification"):
         value, quote, details = direct
         if _d23_has_direct_basis(target_field, value, quote):
@@ -799,7 +885,16 @@ and pending conformity assessment does not imply review of the change plan.
             if isinstance(remaining, str) and remaining.strip():
                 updated["missing_detail"] = remaining.strip()[:300]
             suggestions[target_field] = updated
+    procedure = suggestions.get("ACC-021")
+    if procedure and procedure["value"] in ("Yes", "Partly") and not detail_followup:
+        support = f"{procedure['quote']} {procedure['details']}"
+        if not re.search(r"\b(?:sop|procedure|qms)[ -][A-Z]*-?\d|\b(?:document|procedure) ID\b", support, re.I) or not re.search(
+            r"\b(?:version|revision|rev\.?)\s*[:#]?\s*[A-Z0-9]|\bv\d", support, re.I,
+        ):
+            procedure["missing_detail"] = "What is the procedure's document ID and version?"
     clarification = result.get("clarification", "")
+    if (blocked_target or not clarification) and target_field not in suggestions and target_field in _D23_CLARIFICATIONS:
+        clarification = _D23_CLARIFICATIONS[target_field]
     if target_field == "ACC-020" and target_field not in suggestions and not clarification:
         clarification = ("Which framework and status do you mean? Developing documentation or waiting for a "
                          "conformity assessment does not establish that the change plan has been submitted or is under review.")

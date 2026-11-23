@@ -12,6 +12,7 @@ from app.chatbot.chat_llm import extract_d23_candidates
 from app.deliverable_2.questionnaires.algorithm_change_control import (
     BY_ID,
     FRAMEWORKS,
+    LOCKED,
     is_blank,
     needs_details,
 )
@@ -59,6 +60,28 @@ def _complete(field_id, answer):
     )
 
 
+def _unknown(value):
+    selections = value.values() if isinstance(value, dict) else value if isinstance(value, list) else (value,)
+    return "Unknown" in selections
+
+
+def _deployment_conflict(values):
+    if values.get("ACC-008") != LOCKED:
+        return set()
+    fields = set()
+    if values.get("ACC-007") in ("Configurable by site or user", "Adjusted automatically"):
+        fields.add("ACC-007")
+    if set(values.get("ACC-009") or ()) - {"None", "Unknown"}:
+        fields.add("ACC-009")
+    return fields | {"ACC-008"} if fields else set()
+
+
+_CONFLICT_QUESTION = (
+    "You described the deployed model as locked, but also described settings or components that can change. "
+    "Can they change at a site without a new manufacturer release, or only between releases?"
+)
+
+
 def d23_section_gaps():
     adapter = st.session_state.d23_adapter
     if not adapter.algorithm_ids:
@@ -67,9 +90,20 @@ def d23_section_gaps():
     gaps = []
     for algorithm_id in adapter.algorithm_ids:
         problems = adapter.build_record(algorithm_id)["validation_problems"]
-        if problems:
+        algorithm = adapter.get_algorithm(algorithm_id)
+        name = _identity(algorithm)
+        active = adapter.active_field_ids(algorithm_id)
+        answers = algorithm["answers"]
+        unknowns = [field for field in active if _unknown(answers.get(field, {}).get("value"))]
+        conflict = _deployment_conflict({field: answer["value"] for field, answer in answers.items()})
+        if problems or unknowns or conflict:
             incomplete.append(algorithm_id)
-        name = _identity(adapter.get_algorithm(algorithm_id))
+        gaps.extend(
+            f"{name} · {_question(field)} · Recorded as Unknown. Supporting information remains unresolved."
+            for field in unknowns
+        )
+        if conflict:
+            gaps.append(f"{name} · {_CONFLICT_QUESTION}")
         gaps.extend(f"{name} · {_question(issue['id'])} · {issue['problem']}"
                     for issue in problems)
     active_id = st.session_state.get("d23_active_algorithm_id")
@@ -189,6 +223,22 @@ def _submit_turn(adapter, conversation, algorithm_id, field_id, message, *, init
         candidate["unresolved_frameworks"] = [key for key in candidate.get("unresolved_frameworks", ())
                                               if key not in previous_statuses]
         candidate["details"] = " ".join(filter(None, (existing["details"], candidate["details"])))
+    confirmed_values = {field: answer["value"] for field, answer in algorithm["answers"].items()}
+    prospective = {**confirmed_values, **{field: item["value"] for field, item in suggestions.items()}}
+    conflict = _deployment_conflict(prospective)
+    conflicted = {
+        field for field in conflict & suggestions.keys()
+        if _deployment_conflict({**confirmed_values, field: suggestions[field]["value"]})
+        or field not in confirmed_values
+    }
+    if conflicted:
+        for field in conflicted:
+            suggestions.pop(field)
+            conversation["candidates"].pop(field, None)
+        conversation["conflict_target"] = next(field for field in BY_ID if field in conflicted)
+        clarification = _CONFLICT_QUESTION
+    elif field_id in suggestions or any(item["correction"] for item in suggestions.values()):
+        conversation.pop("conflict_target", None)
     for field, candidate in suggestions.items():
         rejected = conversation["rejected"].get(field, ())
         details = _evidence_key(candidate["details"])
@@ -337,6 +387,11 @@ def _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggesti
                     if needs_details(field_id, value) and not details.strip():
                         subject = "the component explanation" if field_id == "ACC-005" else "an explanation"
                         raise ValueError(f"Enter {subject} before confirming, or skip this suggestion for now.")
+                    if candidate.get("missing_detail") and details.strip() == candidate["details"].strip():
+                        raise ValueError("Supply the requested information or skip this suggestion for now.")
+                    values = {field: answer["value"] for field, answer in algorithm["answers"].items()}
+                    if field_id in _deployment_conflict({**values, field_id: value}):
+                        raise ValueError(_CONFLICT_QUESTION)
                     _save_answer(adapter, algorithm_id, field_id, value, details, evidence, conversation, quote)
                 except ValueError as error:
                     st.error(str(error))
@@ -530,7 +585,13 @@ def render_d23_chat():
     with chat:
         st.caption(f"Algorithm: {_identity(algorithm)}")
         completed = len(active) - len(pending)
-        st.progress(completed / len(active), text=f"{completed}/{len(active)} applicable answers complete")
+        st.progress(completed / len(active), text=f"{completed}/{len(active)} applicable responses recorded")
+        findings = [item["message"] for item in adapter.build_record(algorithm_id)["flags"]
+                    if item["severity"] in {"blocking", "gap"}]
+        if findings:
+            with st.expander(f"Review regulatory findings ({len(findings)})"):
+                for finding in findings:
+                    st.write(finding)
         if len(adapter.algorithm_ids) > 1:
             with st.popover("Switch algorithm"):
                 for other_id in adapter.algorithm_ids:
@@ -557,7 +618,10 @@ def render_d23_chat():
                 st.text(message)
         detail_target = next((field for field, candidate in suggestions.items()
                               if _missing_details(field, candidate)), None)
-        current = detail_target or target
+        conflict_target = conversation.get("conflict_target")
+        if conflict_target not in active:
+            conflict_target = None
+        current = detail_target or conflict_target or target
         same_target = current is not None and conversation.get("notice_target") == current
         notice = conversation["notice"] if same_target or conversation.get("notice_target") is None else ""
         if notice and (not detail_target or conversation.get("request_failed")
@@ -569,6 +633,15 @@ def render_d23_chat():
             _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggestions, detail_target)
             if detail_target:
                 question = _detail_question(detail_target, suggestions[detail_target])
+        elif conflict_target:
+            question = _CONFLICT_QUESTION
+            if notice != question:
+                with st.chat_message("assistant"):
+                    st.write(question)
+            if st.button("Set this clarification aside", key=f"d23-conflict-skip-{algorithm_id}"):
+                conversation.pop("conflict_target", None)
+                conversation["notice"] = ""
+                st.rerun()
         elif target:
             question = _question(target)
             existing = algorithm["answers"].get(target)
@@ -583,6 +656,8 @@ def render_d23_chat():
                             "You can describe the matching capability in your own words.")
             elif same_target and target == "ACC-020":
                 question = "Choose a listed status for each framework you can confirm, or tell me the status in chat."
+            elif same_target and "?" in notice:
+                question = notice
             elif same_target:
                 options = BY_ID[target]["options"]
                 if BY_ID[target]["type"] == "select" and 1 < len(options) <= 4:
@@ -590,7 +665,8 @@ def render_d23_chat():
                 else:
                     question = "You can clarify your answer in chat, edit it manually, or skip for now."
             with st.chat_message("assistant"):
-                st.write(question)
+                if question != notice:
+                    st.write(question)
                 if target == "ACC-020" and same_target:
                     st.caption("Available statuses: " + " · ".join(BY_ID[target]["options"]))
                 context_ref = {"ACC-001": "PIP-001", "ACC-007": "AIF-009"}.get(target)
@@ -616,7 +692,12 @@ def render_d23_chat():
                 st.write("This algorithm still has questions to resolve. Use the gap summary to resume.")
         else:
             with st.chat_message("assistant"):
-                st.write(f"Required answers for {_identity(algorithm)} are complete. You can add another algorithm or return to an existing one.")
+                if any(_unknown(answer["value"]) for answer in algorithm["answers"].values()) or _deployment_conflict(
+                    {field: answer["value"] for field, answer in algorithm["answers"].items()}
+                ):
+                    st.write("The required responses are recorded. Documentation gaps remain in the summary below.")
+                else:
+                    st.write(f"Required responses for {_identity(algorithm)} are recorded. This does not establish regulatory readiness.")
         message = st.chat_input(
             "Describe this algorithm or answer in your own words",
             key=f"d23-chat-input-{algorithm_id}", disabled=bool(suggestions) and detail_target is None,

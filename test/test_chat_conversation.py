@@ -340,6 +340,60 @@ class GuidedConversationTests(unittest.TestCase):
         self.click("Confirm suggestion")
         self.assertIn("PIP-002", adapter.get_algorithm(record)["answers"]["ACC-017"]["details"])
 
+    def test_future_process_is_not_a_documented_procedure_or_release(self):
+        proposed = {}
+        self.mock_proposals("D2.3", proposed)
+        adapter, record = self.start_algorithm_at("ACC-021")
+        adapter.save_answer(record, "ACC-013", "No")
+        self.app.run()
+        future = "All modifications will undergo manufacturer-controlled risk assessment, verification, validation, and approval before deployment."
+        proposed.update({
+            "ACC-021": {"value": "Unknown", "quote": future, "details": future},
+            "ACC-029": {"value": "Changes have been made since last release", "quote": future, "details": future},
+            "ACC-023": {"value": "Verification and validation were performed.", "quote": future},
+        })
+        key = f"d23-chat-input-{record}"
+        self.submit(key, future)
+        self.assertFalse(self.state.d23_conversations[record]["candidates"])
+        self.assertTrue(any("already documented in an approved procedure" in node.value for node in self.app.markdown))
+        proposed.clear()
+        self.submit(key, "I don't know. The quality team cannot provide the procedure record yet.")
+        self.assertNotIn("ACC-021", adapter.get_algorithm(record)["answers"])
+        self.click("Confirm suggestion")
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-021"]["value"], "Unknown")
+        self.assertTrue(any("How is each change assessed" in node.value for node in self.app.markdown))
+
+    def test_conflicting_deployed_behavior_requests_clarification_without_overwrite(self):
+        proposed = {}
+        self.mock_proposals("D2.3", proposed)
+        adapter, record = self.start_algorithm_at("ACC-009")
+        quote = "The model weights change at the site without a new release."
+        proposed["ACC-009"] = {"value": ["Model weights"], "quote": quote}
+        key = f"d23-chat-input-{record}"
+        self.submit(key, quote)
+        self.assertFalse(self.state.d23_conversations[record]["candidates"])
+        self.assertTrue(any("without a new manufacturer release, or only between releases" in node.value
+                            for node in self.app.markdown))
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-008"]["value"], LOCKED)
+        clarification = "No elements change without a new release. We retrain offline between releases."
+        proposed["ACC-009"] = {"value": ["None"], "quote": clarification}
+        self.submit(key, clarification)
+        self.click("Confirm suggestion")
+        answers = adapter.get_algorithm(record)["answers"]
+        self.assertEqual(answers["ACC-009"]["value"], ["None"])
+        self.assertEqual(answers["ACC-008"]["value"], LOCKED)
+
+    def test_natural_release_history_correction_requires_confirmation(self):
+        self.mock_proposals("D2.3", {})
+        adapter, record = self.start_algorithm_at("ACC-021")
+        adapter.save_answer(record, "ACC-029", "None")
+        self.app.run()
+        self.submit(f"d23-chat-input-{record}", "Actually, we haven't released this algorithm yet.")
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-029"]["value"], "None")
+        self.click("Confirm suggestion")
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-029"]["value"],
+                         "Not applicable (not previously released)")
+
     def test_component_details_use_original_message_and_keep_evidence_blank(self):
         proposed = {}
         calls = self.mock_proposals("D2.3", proposed)
