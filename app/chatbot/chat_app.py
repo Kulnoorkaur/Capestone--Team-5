@@ -24,7 +24,7 @@ from app.chatbot.chat_llm import (
 )
 
 from app.chatbot.chat_navigation import render_section_footer
-from app.chatbot.d23_chat import d23_section_gaps, render_d23_chat, resume_d23
+from app.chatbot.d23_chat import d23_section_gaps, render_d23_chat, render_d23_history, resume_d23
 from app.chatbot.d24_adapter import D24AnswerAdapter
 from app.chatbot.d24_chat import render_d24_chat
 from app.chatbot.d24_metadata import D24CompatibilityError
@@ -509,6 +509,7 @@ def reset_application():
         "ux_resume_dataset",
         "ux_review_widget_drafts",
         "ux_d23_add",
+        "ux_d23_entered",
         "ux_d23_proposal",
         "ux_d23_introductions",
         "ux_d24_add",
@@ -620,7 +621,7 @@ def apply_combined_profile(profile: CombinedProfile):
     )
     state.pop("d23_active_algorithm_id", None)
     state.pop("d23-algorithm-picker", None)
-    for key in ("ux_d23_add", "ux_d23_proposal", "ux_d23_introductions", "ux_resume_algorithm", "ux_select_algorithm"):
+    for key in ("ux_d23_add", "ux_d23_entered", "ux_d23_proposal", "ux_d23_introductions", "ux_resume_algorithm", "ux_select_algorithm"):
         state.pop(key, None)
     saved_drafts = state.get("ux_review_widget_drafts", {})
     saved_drafts.pop("D2.1/D2.2", None)
@@ -838,25 +839,14 @@ if (
 # CHAT BUDDY
 # ============================================================
 
-def render_d21_d22_chat():
-
-    st.subheader(
-        "Product Assessment Conversation"
-    )
-
-    # --------------------------------------------------------
-    # DISPLAY CONVERSATION
-    # --------------------------------------------------------
-
+def render_profile_transcript():
     for message in st.session_state.unified_messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-        with st.chat_message(
-            message["role"]
-        ):
 
-            st.markdown(
-                message["content"]
-            )
+def render_d21_d22_chat():
+    render_profile_transcript()
 
     # --------------------------------------------------------
     # REVIEW SUGGESTIONS
@@ -1137,6 +1127,8 @@ def navigate_to(section):
     state.ux_navigation_revision = state.get("ux_navigation_revision", 0) + 1
     state.d23_mode = section in ("D2.3", "D2.4")
     state.d24_mode = section == "D2.4"
+    if section == "D2.3" or current in ("D2.3", "D2.4"):
+        state.ux_d23_entered = True
     if section == "D2.1/D2.2":
         # Returning to the transcript should not run carryover extraction.
         state.needs_next_question = False
@@ -1144,15 +1136,25 @@ def navigate_to(section):
 
 
 with chat_tab:
+    st.subheader("Product Assessment Conversation")
+    if (not st.session_state.get("d23_mode") and not st.session_state.get("ux_d23_entered")
+            and st.session_state.questionnaire_complete and not st.session_state.field_suggestions
+            and not d21_d22_gaps()):
+        navigate_to("D2.3")
     navigation_revision = st.session_state.get("ux_navigation_revision", 0)
     if st.session_state.get("d24_mode", False):
         if st.button("Back to D2.3", key=f"section-back-d24-{navigation_revision}"):
             navigate_to("D2.3")
+        render_profile_transcript()
+        render_d23_history()
         render_d24_chat()
     elif st.session_state.get("d23_mode", False):
         if st.button("Back to D2.1 and D2.2", key=f"section-back-d23-{navigation_revision}"):
             navigate_to("D2.1/D2.2")
-        render_d23_chat()
+        render_profile_transcript()
+        with st.chat_message("assistant"):
+            st.write("Let’s document the algorithms that power your product’s AI functions and how changes are controlled.")
+        render_d23_chat(continue_to_datasets=lambda: navigate_to("D2.4"))
         gaps, resume_record = d23_section_gaps()
         revision = st.session_state.d23_answer_revision
         active_id = st.session_state.get("d23_active_algorithm_id")

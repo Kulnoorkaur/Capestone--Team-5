@@ -429,8 +429,10 @@ def _algorithm_tools(adapter, state):
             skipped.difference_update(issue["id"] for issue in adapter.build_record(resume)["validation_problems"])
     if "d23-algorithm-picker" not in state:
         active = state.get("d23_active_algorithm_id")
-        if active in adapter.algorithm_ids:
-            state["d23-algorithm-picker"] = active
+        if active not in adapter.algorithm_ids:
+            active = next((item for item in adapter.algorithm_ids if adapter.build_record(item)["validation_problems"]),
+                          adapter.algorithm_ids[-1])
+        state["d23-algorithm-picker"] = active
     return st.selectbox(
         "Selected algorithm",
         adapter.algorithm_ids,
@@ -519,14 +521,42 @@ def _question_actions(adapter, algorithm_id, field_id, conversation):
                 _save_answer(adapter, algorithm_id, field_id, unknown, details, "", conversation)
 
 
-def render_d23_chat():
+def _render_algorithm_turns(algorithm_id, conversation):
+    introduction = st.session_state.get("ux_d23_introductions", {}).get(algorithm_id)
+    if introduction:
+        with st.chat_message("user"):
+            st.text(introduction)
+    questions = conversation.get("questions", {})
+    for number, message in enumerate(conversation["turns"], 1):
+        if question := questions.get(str(number)):
+            with st.chat_message("assistant"):
+                st.text(question)
+        with st.chat_message("user"):
+            st.text(message)
+
+
+def render_d23_history(*, exclude=None):
+    """Show earlier algorithm turns in the shared transcript without review controls."""
+    state = st.session_state
+    adapter = state.get("d23_adapter")
+    if not adapter:
+        return
+    conversations = state.get("d23_conversations", {})
+    for algorithm_id in adapter.algorithm_ids:
+        if algorithm_id == exclude or algorithm_id not in conversations or not conversations[algorithm_id]["turns"]:
+            continue
+        with st.chat_message("assistant"):
+            st.caption(f"Algorithm · {_identity(adapter.get_algorithm(algorithm_id))}")
+        _render_algorithm_turns(algorithm_id, conversations[algorithm_id])
+
+
+def render_d23_chat(*, continue_to_datasets=None):
     state = st.session_state
     if "d23_adapter" not in state:
         state.d23_adapter = D23AnswerAdapter()
         state.d23_answer_revision = 0
     adapter = state.d23_adapter
     conversations = state.setdefault("d23_conversations", {})
-    st.subheader("D2.3 — Algorithm Change Control")
 
     # Reserve the main conversation above the technical controls.
     chat = st.container()
@@ -535,6 +565,7 @@ def render_d23_chat():
         algorithm_id = _algorithm_tools(adapter, state)
 
     with chat:
+        render_d23_history(exclude=algorithm_id if not state.get("ux_d23_add") else None)
         if not algorithm_id and adapter.algorithm_ids and not state.get("ux_d23_add"):
             with st.chat_message("assistant"):
                 st.write("Which algorithm would you like to resume?")
@@ -605,17 +636,7 @@ def render_d23_chat():
             keep_record_drafts(conversations, algorithm_id, None, "d23-review-", "d23-answer-")
             state.ux_d23_add = True
             st.rerun()
-        introduction = state.get("ux_d23_introductions", {}).get(algorithm_id)
-        if introduction:
-            with st.chat_message("user"):
-                st.text(introduction)
-        questions = conversation.get("questions", {})
-        for number, message in enumerate(conversation["turns"], 1):
-            if question := questions.get(str(number)):
-                with st.chat_message("assistant"):
-                    st.text(question)
-            with st.chat_message("user"):
-                st.text(message)
+        _render_algorithm_turns(algorithm_id, conversation)
         detail_target = next((field for field, candidate in suggestions.items()
                               if _missing_details(field, candidate)), None)
         conflict_target = conversation.get("conflict_target")
@@ -698,11 +719,32 @@ def render_d23_chat():
                     st.write("The required responses are recorded. Documentation gaps remain in the summary below.")
                 else:
                     st.write(f"Required responses for {_identity(algorithm)} are recorded. This does not establish regulatory readiness.")
+        ready_for_next = not suggestions and target is None and not conflict_target
+        if ready_for_next:
+            with st.chat_message("assistant"):
+                st.write("Do you need to document another algorithm? Say yes to add one, or no to move on to datasets.")
         message = st.chat_input(
             "Describe this algorithm or answer in your own words",
             key=f"d23-chat-input-{algorithm_id}", disabled=bool(suggestions) and detail_target is None,
         )
         if message and message.strip() and (not suggestions or detail_target):
+            choice = message.strip().casefold().rstrip(".!")
+            add_another = choice in {"yes", "yes, add another algorithm", "add another algorithm"}
+            move_on = continue_to_datasets and choice in {"no", "no, continue", "no thanks", "continue to datasets"}
+            if ready_for_next and (add_another or move_on):
+                conversation["turns"].append(message)
+                conversation.setdefault("questions", {})[str(len(conversation["turns"]))] = (
+                    "Do you need to document another algorithm?"
+                )
+                if add_another:
+                    keep_record_drafts(conversations, algorithm_id, None, "d23-review-", "d23-answer-")
+                    state.ux_d23_add = True
+                elif not d23_section_gaps()[0]:
+                    continue_to_datasets()
+                else:
+                    conversation["notice"] = "Review the remaining gaps below, then choose Continue with gaps to move on."
+                    conversation["notice_target"] = None
+                st.rerun()
             _submit_turn(adapter, conversation, algorithm_id, current, message, question=question)
             st.rerun()
     with tools:

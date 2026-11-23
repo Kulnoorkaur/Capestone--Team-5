@@ -95,12 +95,17 @@ class ChatNavigationTests(unittest.TestCase):
         self.assertEqual(self.state.active_questionnaire, "D2.2")
         self.assertTrue(self.state.asked_field.startswith("AIF-"))
         self.fill_bridge("D2.2")
+        self.state.unified_messages.append({"role": "user", "content": "Previously documented AI functions."})
         self.state.needs_next_question = True
         self.app.run()
         self.assertTrue(self.state.questionnaire_complete)
-        self.assert_footer("D2.1 and D2.2 complete", "Continue to D2.3", self.app.chat_input[0])
+        self.assertTrue(self.state.d23_mode)
+        self.assertTrue(any(item.value == "Previously documented AI functions." for item in self.app.markdown))
         self.app.run()
-        self.assertEqual(sum("D2.1 and D2.2 complete" in item.value for item in self.app.markdown), 1)
+        self.assertEqual(sum("Let’s document the algorithms" in item.value for item in self.app.markdown), 1)
+        self.click("Back to D2.1 and D2.2")
+        self.assertFalse(self.state.d23_mode)
+        self.assert_footer("D2.1 and D2.2 complete", "Continue to D2.3", self.app.chat_input[0])
         self.click("Continue to D2.3")
         self.assertTrue(any("What is its name and version?" in item.value for item in self.app.markdown))
         self.assert_footer("D2.3 has unresolved", "Continue with gaps", self.button("Add algorithm"))
@@ -113,6 +118,27 @@ class ChatNavigationTests(unittest.TestCase):
         self.assertTrue(gaps.proto.expanded)
         self.click("Confirm continue with gaps")
         self.assertTrue(any("Add a dataset to begin" in item.value for item in self.app.caption))
+
+    def test_completed_algorithm_can_move_to_datasets_in_chat(self):
+        adapter = D23AnswerAdapter()
+        algorithm = adapter.add_algorithm("Screening model")
+        self.fill_algorithm(adapter, algorithm)
+        self.state.d23_adapter = adapter
+        self.state.d23_mode = True
+        self.state.d23_answer_revision = 0
+        self.state.d23_active_algorithm_id = algorithm
+        self.app.run()
+        self.assertTrue(any("Do you need to document another algorithm?" in item.value for item in self.app.markdown))
+        self.app.chat_input(key=f"d23-chat-input-{algorithm}").set_value("Yes.").run()
+        self.assertFalse(self.app.exception)
+        self.assertTrue(any(item.value == "Yes." for item in self.app.text))
+        self.assertEqual(adapter.algorithm_ids, (algorithm,))
+        self.assertIsNotNone(self.app.chat_input(key="ux_d23_proposal-message"))
+        self.click("Return to current algorithm")
+        self.app.chat_input(key=f"d23-chat-input-{algorithm}").set_value("No.").run()
+        self.assertFalse(self.app.exception)
+        self.assertTrue(self.state.d24_mode)
+        self.assertTrue(any(item.value == "No." for item in self.app.text))
 
     def test_algorithm_completion_is_section_wide_and_stale_navigation_is_ignored(self):
         adapter = D23AnswerAdapter()

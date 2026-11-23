@@ -438,6 +438,17 @@ class GuidedConversationTests(unittest.TestCase):
         self.assertTrue(any("Which confirmed AI-function entries" in node.value for node in self.app.markdown))
         self.assertEqual(self.state.d23_conversations[record]["turns"].count(FUNCTION_DESCRIPTION), 1)
 
+    def test_algorithm_name_and_version_can_arrive_in_separate_turns(self):
+        self.submit("ux_d23_proposal-message", "Our algorithm is called Retinal Screening.")
+        self.assertTrue(any("What version of Retinal Screening" in node.value for node in self.app.markdown))
+        self.assertFalse(self.state.d23_adapter.algorithm_ids)
+        self.submit("ux_d23_proposal-message", "The version is 2.4.")
+        self.assertFalse(self.state.d23_adapter.algorithm_ids)
+        self.click("Confirm algorithm record")
+        record = self.state.d23_adapter.get_algorithm(self.state.d23_active_algorithm_id)
+        self.assertEqual((record["name"], record["version"]), ("Retinal Screening", "2.4"))
+        self.assertIn("The version is 2.4.", self.d23_extractor.call_args.args[0])
+
     def test_exact_retinaguard_description_becomes_a_single_review_turn(self):
         proposed = {
             "ACC-004": {"value": ["CNN"], "quote": "It uses a convolutional neural network"},

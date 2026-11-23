@@ -66,7 +66,7 @@ class D23ChatTests(unittest.TestCase):
         self.app.button(key="save_manual_AIF-020").click().run()
         self.assert_no_errors()
         self.assertTrue(self.app.session_state.questionnaire_complete)
-        self.click("Continue to D2.3")
+        self.assertTrue(self.app.session_state.d23_mode)
 
     def add_algorithm(self, name, version):
         self.app.text_input(key="d23-new-name").set_value(name)

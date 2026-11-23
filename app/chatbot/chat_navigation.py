@@ -98,14 +98,40 @@ def propose_record_identity(message, *, algorithm=False, include_version=True):
 def render_record_proposal(key, question, *, algorithm=False, include_version=True):
     """Collect an identity draft from chat. Only return it after confirmation."""
     state = st.session_state
+    previous = state.get(key)
+    prompt = question
+    if algorithm and previous:
+        prior_text, proposed_name, proposed_version, _ = previous
+        version_unknown = re.search(r"\b(?:unknown|not sure|don.t know|not available)\b",
+                                    prior_text.splitlines()[-1], re.I)
+        if not proposed_name:
+            prompt = "What is the name of this algorithm?"
+        elif not proposed_version and not version_unknown:
+            prompt = f"What version of {proposed_name} are you documenting? You can say if it’s unknown."
+        else:
+            prompt = "Please confirm the algorithm name and version below."
     with st.chat_message("assistant"):
-        st.write(question)
+        st.write(prompt)
     message = st.chat_input("Describe the new record", key=f"{key}-message", max_chars=8000)
     if message and message.strip():
         identity, version = propose_record_identity(message, algorithm=algorithm, include_version=include_version)
+        text = message
+        if algorithm:
+            version_reply = re.fullmatch(
+                r"\s*(?:(?:the )?version(?: is|:)?\s*|v\s*)?(\d[\w.-]*?)\.?\s*",
+                message, re.I,
+            )
+            if version_reply:
+                identity, version = "", version_reply[1]
+            if previous:
+                earlier_text, earlier_name, earlier_version, _ = previous
+                if not earlier_name or not earlier_version:
+                    text = f"{earlier_text}\n{message}"
+                    identity = earlier_name or identity
+                    version = earlier_version or version
         generation = state.get("ux_record_proposal_generation", 0) + 1
         state.ux_record_proposal_generation = generation
-        state[key] = (message, identity, version, generation)
+        state[key] = (text, identity, version, generation)
         st.rerun()
     if key not in state:
         return None
