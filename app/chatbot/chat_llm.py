@@ -533,7 +533,7 @@ def _d23_has_direct_basis(field_id, value, quote):
     return True
 
 
-def _d23_reference_supported(value, quote, evidence, confirmed_answers, *, prefixes="AIF"):
+def _d23_reference_supported(value, quote, evidence, confirmed_answers, *, prefixes="AIF", allow_option_match=False):
     if not isinstance(value, str):
         return False
     reference_id = rf"(?:{prefixes})-\d{{3}}(?:-[A-Z]+)?"
@@ -558,9 +558,34 @@ def _d23_reference_supported(value, quote, evidence, confirmed_answers, *, prefi
         snippet = evidence.get(reference)
         if not any(isinstance(item, str) and _quoted_in(snippet, item) for item in excerpts):
             return False
-        if len(terms(snippet) & terms(quote)) < 2:
+        shared = terms(snippet) & terms(quote)
+        if len(shared) < 2 and not (
+            allow_option_match and isinstance(answer, list) and snippet in answer
+            and snippet.casefold() not in {"other", "unknown", "none"}
+            and re.search(rf"\b{re.escape(snippet)}s?\b", quote, re.I)
+        ):
             return False
     return True
+
+
+def _d23_function_matches(matches, source, confirmed_answers):
+    """Validate each proposed association independently against both actual answers."""
+    if not isinstance(matches, dict):
+        return {}
+    verified = {}
+    for field_id, match in matches.items():
+        if field_id not in confirmed_answers or not isinstance(match, dict):
+            continue
+        quote = match.get("quote")
+        excerpt = match.get("confirmed_excerpt")
+        answer = confirmed_answers[field_id]
+        confirmed_parts = answer if isinstance(answer, list) else [answer]
+        if (_quoted_in(quote, source) and any(_quoted_in(excerpt, part) for part in confirmed_parts)
+                and _d23_reference_supported(
+                    field_id, quote, {field_id: excerpt}, confirmed_answers, allow_option_match=True,
+                )):
+            verified[field_id] = quote
+    return verified
 
 
 _D23_FRAMEWORK_NAMES = {
@@ -730,12 +755,20 @@ Keep the pending value unless the user clearly corrects it. Do not treat the old
 quote from the new message. Do not turn uncertainty into certainty or return
 product-document evidence.
 
-For ACC-002, return the AIF references named explicitly in user_message or link
-a concrete capability described there to matching confirmed_d22_answers. For
-inferred references, return only the IDs as a comma-separated string and include
-reference_evidence mapping each ID to an exact excerpt of its confirmed D2.2
-answer showing the match. Omit ACC-002 and ask which reference applies if the
-link is uncertain. A general mention of D2.2 does not identify a reference.
+For ACC-002, examine EVERY confirmed_d22_answers entry and its label, even
+after finding one match. Compare each entry's specific role against what the
+algorithm explicitly does. Include all directly supported AIF IDs as one
+comma-separated value. Also return reference_matches keyed by AIF ID; each
+match must contain quote (an exact excerpt from user_message supporting that
+specific role) and confirmed_excerpt (an exact excerpt from that confirmed
+D2.2 answer). A named ID may be cited explicitly, but do not propose IDs
+absent from confirmed_d22_answers. Shared product or imaging terminology alone
+is insufficient. If a possible additional role is unclear, ask one focused
+clarification rather than selecting it. In details, return exact excerpts
+explaining the roles, not just the reference IDs.
+For all fields, put relevant exact supporting excerpts in details even when
+the owner does not require an explanation. For architecture, capture the
+model family and any supplied description of how it is used.
 For ACC-017, use references (a comma-separated string) and reference_evidence
 in the same way for affected confirmed D2.1/D2.2 answers. Include exact
 supporting wording about the change in details. Never invent a reference.
@@ -799,16 +832,40 @@ and pending conformity assessment does not imply review of the change plan.
         if not _d23_has_direct_basis(field_id, value, quote):
             blocked_target |= field_id == target_field
             continue
-        if field_id == "ACC-002" and not _d23_reference_supported(
-            value, quote, proposed.get("reference_evidence"), d22_answers,
-        ):
-            continue
         source = quote if other_mentions else message
-        details = _d23_explanation(proposed.get("details") or proposed.get("explanation"), source)
+        matches = {}
+        if field_id == "ACC-002":
+            matches = _d23_function_matches(proposed.get("reference_matches"), source, d22_answers)
+            # Earlier responses used a single quote and a separate excerpt map.
+            if "reference_matches" not in proposed and isinstance(value, str) and re.fullmatch(
+                r"AIF-\d{3}(?:-[A-Z]+)?(?:\s*(?:[,;]|and)\s*AIF-\d{3}(?:-[A-Z]+)?)*", value.strip()
+            ):
+                for field in dict.fromkeys(re.findall(r"\bAIF-\d{3}(?:-[A-Z]+)?\b", value)):
+                    if field in d22_answers and field not in matches and _d23_reference_supported(
+                        field, quote, proposed.get("reference_evidence"), d22_answers, allow_option_match=True,
+                    ):
+                        matches[field] = quote
+            if not matches:
+                continue
+            value = ", ".join(matches)
+        details = (_d23_explanation(proposed.get("details"), source)
+                   or _d23_explanation(proposed.get("explanation"), source))
+        if matches:
+            role_details = _d23_explanation([
+                excerpt for excerpt in matches.values() if len(re.findall(r"[A-Za-z]+", excerpt)) >= 3
+            ], source)
+            details = role_details or details
+        if not details and field_id == "ACC-004" and not other_mentions:
+            # Recover the same model-description sentence if the quote is just the model family.
+            sentence = next((part for part in re.split(r"(?<=[.!?])\s+|\n", source)
+                             if quote in part and re.search(r"\b(?:uses?|employs?|architecture|network|model)\b", part, re.I)), "")
+            if sentence and sentence != quote:
+                details = sentence
         if not details and field_id == target_field and direct and value == direct[0]:
             details = direct[2]
         if (not details and not (proposed.get("details") or proposed.get("explanation"))
-                and field_id == target_field and fields[field_id]["type"] in {"select", "multiselect"}):
+                and (field_id == target_field or field_id == "ACC-004")
+                and fields[field_id]["type"] in {"select", "multiselect"}):
             selections = [value] if isinstance(value, str) else value
             if isinstance(selections, list) and all(isinstance(item, str) for item in selections):
                 if len(quote.split()) >= 5 and quote.strip(" .!?") not in selections:
@@ -826,6 +883,8 @@ and pending conformity assessment does not imply review of the change plan.
             "details": details,
             "correction": correction,
         }
+        if field_id == "ACC-002" and proposed.get("reference_matches"):
+            suggestions[field_id]["reference_quotes"] = matches
         if unresolved_frameworks:
             suggestions[field_id]["unresolved_frameworks"] = sorted(unresolved_frameworks)
         missing_detail = proposed.get("missing_detail")

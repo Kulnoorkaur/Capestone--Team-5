@@ -122,6 +122,50 @@ class GuidedConversationTests(unittest.TestCase):
         self.assertFalse(any(node.label == "Confirm suggestion" for node in self.app.button))
         self.assertTrue(any("learning approach" in node.value.lower() for node in self.app.markdown))
 
+    def test_retinaguard_review_includes_all_independently_supported_functions(self):
+        response = (
+            "The RetinaGuard DR Detection Algorithm implements the previously documented AI functions related "
+            "to retinal image preprocessing, diabetic retinopathy detection, and screening risk-score generation. "
+            "It uses a convolutional neural network (CNN) to analyze retinal fundus photographs, identify retinal "
+            "abnormalities, and generate screening classifications and risk scores."
+        )
+        preprocessing = "retinal image preprocessing, diabetic retinopathy detection"
+        scoring = "generate screening classifications and risk scores"
+        bridge = self.state.questionnaire_bridge
+        self.assertTrue(bridge.save_answer("AIF-004", preprocessing)[0])
+        self.assertTrue(bridge.save_answer("AIF-006", ["Score"])[0])
+        self.assertTrue(bridge.save_answer("AIF-007", ["Dashboard"])[0])
+        proposed = {}
+        calls = self.mock_proposals("D2.3", proposed)
+        self.submit("ux_d23_proposal-message", RETINAGUARD)
+        self.click("Confirm algorithm record")
+        adapter = self.state.d23_adapter
+        record = adapter.algorithm_ids[0]
+        proposed.update({
+            "ACC-002": {
+                "value": "AIF-004", "quote": response,
+                "reference_matches": {
+                    "AIF-004": {"quote": preprocessing, "confirmed_excerpt": preprocessing},
+                    "AIF-006": {"quote": scoring, "confirmed_excerpt": "Score"},
+                    "AIF-007": {"quote": scoring, "confirmed_excerpt": "Dashboard"},
+                    "AIF-999": {"quote": scoring, "confirmed_excerpt": "Score"},
+                },
+            },
+            "ACC-004": {"value": ["CNN"], "quote": "CNN"},
+        })
+        self.submit(f"d23-chat-input-{record}", response)
+        self.assertEqual(set(calls[-1]["confirmed_d22_answers"]), {"AIF-004", "AIF-006", "AIF-007"})
+        self.assertEqual(self.app.text_input(key=f"d23-review-{record}-2-ACC-002").value, "AIF-004, AIF-006")
+        explanation = self.app.text_area(key=f"d23-review-{record}-2-ACC-002-details").value
+        self.assertIn(preprocessing, explanation)
+        self.assertIn(scoring, explanation)
+        architecture = self.app.text_area(key=f"d23-review-{record}-2-ACC-004-details").value
+        self.assertEqual(architecture, response.split(". ", 1)[1])
+        self.assertNotIn("ACC-002", adapter.get_algorithm(record)["answers"])
+        self.assertTrue(any("Why this fits your description" in node.value for node in self.app.caption))
+        self.app.button(key=f"d23-review-{record}-2-ACC-002-confirm").click().run()
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-002"]["value"], "AIF-004, AIF-006")
+
     def start_algorithm_at(self, target):
         self.submit("ux_d23_proposal-message", RETINAGUARD)
         self.click("Confirm algorithm record")

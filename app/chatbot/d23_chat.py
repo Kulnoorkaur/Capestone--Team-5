@@ -348,7 +348,7 @@ def _detail_question(field_id, candidate):
     return "What details support this answer?"
 
 
-def _render_reference_context(value):
+def _render_reference_context(value, *, quotes=None):
     bridge = st.session_state.get("questionnaire_bridge")
     answers = bridge.get_product_profile() if bridge else {}
     for field in dict.fromkeys(re.findall(r"\b(?:PIP|AIF)-\d{3}(?:-[A-Z]+)?\b", value)):
@@ -357,6 +357,8 @@ def _render_reference_context(value):
             description = ", ".join(answer) if isinstance(answer, list) else answer
             st.caption(f"{field} · {bridge.get_field_label(field)}")
             st.text(description)
+            if quotes and quotes.get(field):
+                st.caption(f"Why this fits your description · {quotes[field]}")
         else:
             st.caption(f"{field} · No confirmed profile answer for this reference.")
 
@@ -373,7 +375,7 @@ def _render_suggestions(adapter, algorithm_id, algorithm, conversation, suggesti
             st.text(f"Source turn {candidate['source_id']}: {candidate['quote']}")
             value = _answer_input(definition, candidate["value"], key)
             if field_id == "ACC-002":
-                _render_reference_context(value)
+                _render_reference_context(value, quotes=candidate.get("reference_quotes"))
             if "detail_source_id" in candidate:
                 st.caption(f"Explanation supplied in follow-up turn {candidate['detail_source_id']}.")
             existing = algorithm["answers"].get(field_id, {})
