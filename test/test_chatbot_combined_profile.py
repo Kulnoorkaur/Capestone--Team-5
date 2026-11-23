@@ -162,7 +162,7 @@ class CombinedProfileStreamlitTests(unittest.TestCase):
 
             def upload(raw):
                 app.run()
-                app.file_uploader(key="combined_profile_upload").set_value(
+                app.file_uploader(key="profile_upload").set_value(
                     ("combined.json", raw.encode(), "application/json")
                 ).run()
                 self.assertFalse(app.exception)
@@ -223,7 +223,7 @@ class CombinedProfileStreamlitTests(unittest.TestCase):
             self.assertEqual(json.loads(calls["Download combined D2.1–D2.3 JSON"]["data"]), json.loads(replacement))
             self.assertEqual(json.loads(calls["Export Confirmed Profile"]["data"]), expected_flat)
             fresh = AppTest.from_file(str(CHAT_APP), default_timeout=25).run()
-            fresh.file_uploader(key="combined_profile_upload").set_value((
+            fresh.file_uploader(key="profile_upload").set_value((
                 "combined.json", calls["Download combined D2.1–D2.3 JSON"]["data"].encode(),
                 "application/json",
             )).run()

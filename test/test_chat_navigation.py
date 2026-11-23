@@ -89,6 +89,71 @@ class ChatNavigationTests(unittest.TestCase):
         self.assertTrue(any("D2.4" in row and "1 record" in row and "gaps" in row for row in rows))
         self.assertTrue(any("D2.5" in row and "Unavailable" in row for row in rows))
 
+    def test_overall_progress_from_empty_through_multiple_record_completion(self):
+        def progress():
+            return next(item.proto for item in self.app.sidebar.get("progress"))
+        self.assertEqual(progress().value, 0)
+        self.assertEqual(progress().text, "Overall questionnaire progress · 0%")
+        self.fill_bridge("D2.1")
+        self.fill_bridge("D2.2")
+        bridge = self.state.questionnaire_bridge
+        product_total = len(bridge.answers)
+        self.app.run()
+        self.assertLess(progress().value, 100)
+
+        algorithms = D23AnswerAdapter()
+        first = algorithms.add_algorithm("First algorithm")
+        second = algorithms.add_algorithm("Second algorithm")
+        self.fill_algorithm(algorithms, first)
+        first_total = len(algorithms.active_field_ids(first))
+        self.state.d23_adapter = algorithms
+        datasets = D24AnswerAdapter()
+        records = [datasets.create_record("dataset") for _ in range(2)]
+        datasets.save_answer(records[0], "DEP-001.dataset_name_version", "Training dataset")
+        records += [datasets.create_record("function"), datasets.create_record("document")]
+        self.state.d24_adapter = datasets
+        self.app.run()
+        applicable = (product_total + first_total + len(algorithms.active_field_ids(second))
+                      + sum(len(datasets.active_fields(record)) for record in [*records, datasets.GMLP]))
+        fraction = (product_total + first_total + 1) / applicable
+        self.assertEqual(progress().value, int(fraction * 100))
+        self.assertEqual(progress().text, f"Overall questionnaire progress · {int(fraction * 100)}%")
+
+        self.fill_algorithm(algorithms, second)
+        for record in [*records, datasets.GMLP]:
+            for field in datasets.field_ids(record):
+                definition = datasets.active_fields(record).get(field)
+                if definition is None:
+                    continue
+                if definition.kind == "text":
+                    value = "Confirmed entry"
+                elif definition.kind == "multiselect":
+                    value = [definition.options[0]]
+                else:
+                    value = definition.options[0]
+                datasets.save_answer(record, field, value)
+        self.app.run()
+        self.assertEqual(progress().value, 100)
+        self.assertEqual(progress().text, "Overall questionnaire progress · 100%")
+        self.assertTrue(any("D2.5" in item.value and "Unavailable" in item.value for item in self.app.sidebar.markdown))
+
+    def test_sidebar_upload_recognizes_legacy_and_waits_for_confirmation(self):
+        bridge = self.state.questionnaire_bridge
+        bridge.save_answer("PIP-001", "Existing profile")
+        self.app.run()
+        uploader = self.app.sidebar.file_uploader(key="profile_upload")
+        self.assertEqual(uploader.label, "Upload Profile")
+        uploader.set_value(("bad.json", b'{"schema":"unknown","version":2}', "application/json")).run()
+        self.assertEqual(bridge.answers, {"PIP-001": "Existing profile"})
+        self.assertTrue(any("Expected a Chat Buddy combined profile" in node.value for node in self.app.error))
+        self.app.sidebar.file_uploader(key="profile_upload").set_value(
+            ("legacy.json", b'{"PIP-001":"Imported profile"}', "application/json"),
+        ).run()
+        self.assertIs(self.state.questionnaire_bridge, bridge)
+        self.assertTrue(any("Legacy D2.1/D2.2 profile" in node.value for node in self.app.sidebar.markdown))
+        self.click("Restore from JSON")
+        self.assertEqual(self.state.questionnaire_bridge.answers, {"PIP-001": "Imported profile"})
+
     def test_documented_unknown_is_a_gap_without_reasking(self):
         adapter = D23AnswerAdapter()
         algorithm = adapter.add_algorithm("Screening model")
@@ -131,7 +196,7 @@ class ChatNavigationTests(unittest.TestCase):
         self.assertFalse(any(item.label == "Review remaining gaps" for item in self.app.expander))
         panel = next(item for item in self.app.expander if item.label == "Review & Edit")
         self.assertFalse(panel.proto.expanded)
-        for label in ("Add algorithm", "Continue with gaps", "Restore from JSON"):
+        for label in ("Add algorithm", "Continue with gaps"):
             self.assertTrue(any(getattr(item, "label", None) == label for item in panel))
         self.button("Continue with gaps").click().run()
         self.assertFalse(self.app.exception)

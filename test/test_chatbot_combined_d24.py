@@ -187,7 +187,7 @@ class D24CombinedProfileStreamlitTests(unittest.TestCase):
             self.click("Confirm continue with gaps")
 
     def upload(self, raw):
-        self.app.file_uploader(key="combined_profile_upload").set_value(
+        self.app.file_uploader(key="profile_upload").set_value(
             ("combined.json", raw.encode(), "application/json"),
         ).run()
         self.assertFalse(self.app.exception, [error.message for error in self.app.exception])
@@ -242,7 +242,7 @@ class D24CombinedProfileStreamlitTests(unittest.TestCase):
         with patch.dict("sys.modules", {"app.deliverable_2.questionnaires.Dataset_and_evidence": None}):
             raw = dump_combined_profile(bridge, algorithms, dataset_evidence=d24)
             fresh = AppTest.from_file(str(CHAT_APP), default_timeout=30).run()
-            fresh.file_uploader(key="combined_profile_upload").set_value(
+            fresh.file_uploader(key="profile_upload").set_value(
                 ("combined.json", raw.encode(), "application/json"),
             ).run()
             self.assertNotIn("d24_adapter", fresh.session_state)
@@ -251,7 +251,7 @@ class D24CombinedProfileStreamlitTests(unittest.TestCase):
             with patch.object(st, "download_button", wraps=st.download_button) as downloads:
                 fresh.run()
             exported = next(call.kwargs["data"] for call in downloads.call_args_list
-                            if call.args[0] == "Download combined D2.1–D2.4 JSON")
+                            if call.args[0] == "Download Profile")
         self.assertEqual(json.loads(exported), json.loads(raw))
 
     def test_v2_preview_atomic_failure_and_explicit_restore_clear_old_review(self):
@@ -300,7 +300,7 @@ class D24CombinedProfileStreamlitTests(unittest.TestCase):
         with patch.object(st, "download_button", wraps=st.download_button) as downloads:
             self.app.run()
         exported = next(call.kwargs["data"] for call in downloads.call_args_list
-                        if call.args[0] == "Download combined D2.1–D2.4 JSON")
+                        if call.args[0] == "Download Profile")
         self.assertEqual(json.loads(exported), json.loads(raw))
         for excluded in ("Old confidential quote", "Old chat turn", "Old model explanation", "source_id", "timestamp"):
             self.assertNotIn(excluded, exported)

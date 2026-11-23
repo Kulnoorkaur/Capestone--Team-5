@@ -196,7 +196,7 @@ class D23ChatTests(unittest.TestCase):
         self.assertEqual(self.app.session_state.d23_active_algorithm_id, second)
         self.answer_key("ACC-003")
 
-        self.app.file_uploader(key="restore_profile_upload").set_value(
+        self.app.file_uploader(key="profile_upload").set_value(
             ("profile.json", json.dumps(flat).encode(), "application/json")
         ).run()
         self.click("Restore from JSON")

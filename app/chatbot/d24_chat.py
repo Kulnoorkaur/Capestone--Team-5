@@ -250,6 +250,20 @@ def _render_record_turns(record_id, conversation):
             st.text(message)
 
 
+def d24_response_progress(adapter):
+    """Count recorded answers against applicable fields for each evidence record."""
+    records = [adapter.record_ids(scope) for scope in _RECORDS]
+    # An empty collection still has its initial record setup question outstanding.
+    total = sum(not group for group in records)
+    recorded = 0
+    for record_id in [adapter.GMLP, *(record for group in records for record in group)]:
+        active = adapter.active_fields(record_id)
+        answers = adapter.get_answers(record_id)
+        total += len(active)
+        recorded += sum(field in answers for field in active)
+    return recorded, total
+
+
 def d24_progress_status(adapter):
     records = [record for scope in _RECORDS for record in adapter.record_ids(scope)]
     if not records and not adapter.get_answers(adapter.GMLP):

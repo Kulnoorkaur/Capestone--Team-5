@@ -26,13 +26,13 @@ from app.chatbot.chat_llm import (
 from app.chatbot.chat_navigation import render_section_footer
 from app.chatbot.d23_chat import d23_response_progress, d23_section_gaps, render_d23_chat, render_d23_history, resume_d23
 from app.chatbot.d24_adapter import D24AnswerAdapter
-from app.chatbot.d24_chat import d24_progress_status, render_d24_chat
+from app.chatbot.d24_chat import d24_progress_status, d24_response_progress, render_d24_chat
 from app.chatbot.d24_metadata import D24CompatibilityError
 from app.chatbot.profile_io import (
     CombinedProfile,
     ProfileImportError,
     dump_combined_profile,
-    load_combined_profile,
+    load_profile_upload,
 )
 from app.chatbot.questionnaire_bridge import CONDITIONAL_FIELDS, QuestionnaireBridge
 from app.deliverable_2.validation.run_ai_function import validate_ai_function
@@ -530,41 +530,8 @@ def reset_application():
     initialize_session()
 
 
-def restore_profile(uploaded_file):
-    """Validate first; replace session only when all answers are valid."""
-    try:
-        raw = uploaded_file.getvalue()
-        if len(raw) > 1_000_000:
-            return False, "File exceeds 1 MB."
-        profile = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        return False, f"Invalid JSON: {error}"
-    if not isinstance(profile, dict):
-        return False, "Expected a JSON object mapping field IDs to answers."
-    candidate = QuestionnaireBridge()
-    from app.chatbot.questionnaire_bridge import QUESTIONNAIRE_FIELDS, CONDITIONAL_FIELDS
-    primary = {field_id for fields in QUESTIONNAIRE_FIELDS.values() for field_id in fields}
-    conditional = set(CONDITIONAL_FIELDS)
-    unknown = set(profile) - primary - conditional
-    if unknown:
-        return False, "Unknown fields: " + ", ".join(sorted(unknown))
-    # Restore parents before children, irrespective of JSON key order.
-    for field_id in sorted(primary):
-        if field_id in profile:
-            valid, error = candidate.save_answer(field_id, profile[field_id])
-            if not valid:
-                return False, f"{field_id}: {error}"
-    active = set()
-    for questionnaire in QUESTIONNAIRES:
-        active.update(candidate.get_active_conditional_fields(questionnaire))
-    inactive = (set(profile) & conditional) - active
-    if inactive:
-        return False, "Inactive conditional fields in backup: " + ", ".join(sorted(inactive))
-    for field_id in sorted(active):
-        if field_id in profile:
-            valid, error = candidate.save_answer(field_id, profile[field_id])
-            if not valid:
-                return False, f"{field_id}: {error}"
+def apply_legacy_profile(candidate):
+    """Replace the two legacy sections after validation and explicit confirmation."""
     st.session_state.retryable_turn = None
     st.session_state.carryover = new_carryover_state()
     st.session_state.questionnaire_bridge = candidate
@@ -586,7 +553,6 @@ def restore_profile(uploaded_file):
         )},
     ]
     st.session_state.get("ux_review_widget_drafts", {}).pop("D2.1/D2.2", None)
-    return True, None
 
 
 def apply_combined_profile(profile: CombinedProfile):
@@ -639,73 +605,40 @@ def apply_combined_profile(profile: CombinedProfile):
                 state.pop(key, None)
 
 
-def render_combined_profile_io():
-    with st.expander("Combined Chat Buddy profile"):
-        algorithms = st.session_state.get("d23_adapter")
-        try:
-            datasets = st.session_state.get("d24_adapter")
-            if datasets is None:
-                datasets = D24AnswerAdapter()
-            backup = dump_combined_profile(bridge, algorithms, dataset_evidence=datasets)
-        except D24CompatibilityError as error:
-            st.warning(f"Version 2 download is unavailable. {error}")
-        else:
-            st.download_button(
-                "Download combined D2.1–D2.4 JSON",
-                data=backup,
-                file_name="chat_buddy_confirmed_profile_v2.json",
-                mime="application/json",
-            )
-        st.download_button(
-            "Download combined D2.1–D2.3 JSON",
-            data=dump_combined_profile(bridge, algorithms),
-            file_name="chat_buddy_confirmed_profile_v1.json",
-            mime="application/json",
+def render_combined_restore(profile):
+    st.write("Complete Chat Buddy profile" if profile.dataset_evidence is not None else "Chat Buddy profile · D2.1–D2.3")
+    for questionnaire, label in (("D2.1", "Product profile"), ("D2.2", "AI function")):
+        answers = profile.bridge.get_questionnaire_answers(questionnaire)
+        st.caption(f"{questionnaire} — {label} · {len(answers)} confirmed answers")
+        st.json(answers, expanded=False)
+    st.caption(f"D2.3 — {len(profile.algorithms.algorithm_ids)} algorithm records")
+    for algorithm_id in profile.algorithms.algorithm_ids:
+        record = profile.algorithms.build_record(algorithm_id)
+        snapshot = profile.algorithms.get_algorithm(algorithm_id)
+        st.text(f"{record['record_name']} ({algorithm_id})")
+        st.json(snapshot["answers"], expanded=False)
+        st.caption(f"Validation findings: {len(record['validation_problems'])}. Flags: {len(record['flags'])}.")
+    if profile.dataset_evidence is None:
+        st.warning(
+            "This version 1 backup contains D2.1–D2.3 only. Restoring it will replace those sections "
+            "and preserve your current D2.4 answers."
         )
-        uploaded = st.file_uploader(
-            "Upload combined Chat Buddy JSON", type=["json"], key="combined_profile_upload"
+    else:
+        dataset_evidence = profile.dataset_evidence
+        st.caption(
+            f"D2.4 — {len(dataset_evidence.record_ids('dataset'))} datasets, "
+            f"{len(dataset_evidence.record_ids('function'))} evaluations, "
+            f"{len(dataset_evidence.record_ids('document'))} documents"
         )
-        if uploaded is None:
-            return
-        try:
-            profile = load_combined_profile(uploaded.getvalue(), allow_d24=True)
-        except ProfileImportError as error:
-            st.error(str(error))
-            return
-
-        st.write("Preview confirmed answers")
-        for questionnaire, label in (("D2.1", "Product profile"), ("D2.2", "AI function")):
-            answers = profile.bridge.get_questionnaire_answers(questionnaire)
-            st.caption(f"{questionnaire} — {label} · {len(answers)} confirmed answers")
-            st.json(answers, expanded=False)
-        st.caption(f"D2.3 — {len(profile.algorithms.algorithm_ids)} algorithm records")
-        for algorithm_id in profile.algorithms.algorithm_ids:
-            record = profile.algorithms.build_record(algorithm_id)
-            snapshot = profile.algorithms.get_algorithm(algorithm_id)
-            st.text(f"{record['record_name']} ({algorithm_id})")
-            st.json(snapshot["answers"], expanded=False)
-            st.caption(f"Validation findings: {len(record['validation_problems'])}. Flags: {len(record['flags'])}.")
-        if profile.dataset_evidence is None:
-            st.warning(
-                "This version 1 backup contains D2.1–D2.3 only. Restoring it will replace those sections "
-                "and preserve your current D2.4 answers."
-            )
-        else:
-            dataset_evidence = profile.dataset_evidence
-            st.caption(
-                f"D2.4 — {len(dataset_evidence.record_ids('dataset'))} datasets, "
-                f"{len(dataset_evidence.record_ids('function'))} evaluations, "
-                f"{len(dataset_evidence.record_ids('document'))} documents"
-            )
-            st.caption(f"D2.4 validation findings: {len(dataset_evidence.validate())}.")
-            st.warning(
-                "Version 2 replaces your confirmed D2.1–D2.4 answers and clears "
-                "pending suggestions, drafts, and conversation history for those sections."
-            )
-        st.caption("Backups preserve confirmed answers and document references. Chat quotations and history are session-only.")
-        if st.button("Restore combined profile"):
-            apply_combined_profile(profile)
-            st.rerun()
+        st.caption(f"D2.4 validation findings: {len(dataset_evidence.validate())}.")
+        st.warning(
+            "Version 2 replaces your confirmed D2.1–D2.4 answers and clears "
+            "pending suggestions, drafts, and conversation history for those sections."
+        )
+    st.caption("Backups preserve confirmed answers and document references. Chat quotations and history are session-only.")
+    if st.button("Restore combined profile"):
+        apply_combined_profile(profile)
+        st.rerun()
 
 
 # ============================================================
@@ -716,61 +649,87 @@ with st.sidebar:
 
     st.subheader("Questionnaire Progress")
     confirmed = bridge.get_product_profile()
+    overall_recorded = overall_total = 0
     for questionnaire in QUESTIONNAIRES:
         progress = bridge.get_questionnaire_progress(questionnaire)
         conditional = bridge.get_active_conditional_fields(questionnaire)
         answered = progress["completed"] + sum(field in confirmed for field in conditional)
         total = progress["total"] + len(conditional)
+        overall_recorded += answered
+        overall_total += total
         st.write(f"**{questionnaire} — {QUESTIONNAIRE_NAMES[questionnaire]}** · {answered}/{total} recorded")
 
     algorithms = st.session_state.get("d23_adapter")
     if algorithms and algorithms.algorithm_ids:
         answered, total = d23_response_progress(algorithms)
+        overall_recorded += answered
+        overall_total += total
         algorithm_status = f"{answered}/{total} recorded"
         if d23_section_gaps()[0]:
             algorithm_status += " · gaps to review"
     else:
+        # The identity prompt is applicable before there is an algorithm record.
+        overall_total += 1
         algorithm_status = "Not started"
     st.write(f"**D2.3 — Algorithm Change Control** · {algorithm_status}")
 
-    datasets = st.session_state.get("d24_adapter")
-    dataset_status = d24_progress_status(datasets) if datasets else "Not started"
+    dataset_error = None
+    try:
+        datasets = st.session_state.get("d24_adapter") or D24AnswerAdapter()
+        backup = dump_combined_profile(bridge, algorithms, dataset_evidence=datasets)
+        answered, total = d24_response_progress(datasets)
+    except D24CompatibilityError as error:
+        dataset_error = error
+        dataset_status = "Unavailable"
+    else:
+        overall_recorded += answered
+        overall_total += total
+        dataset_status = d24_progress_status(datasets)
     st.write(f"**D2.4 — Dataset and Evidence** · {dataset_status}")
     st.write("**D2.5 — Risk Documentation** · Unavailable")
+    overall = overall_recorded * 100 // overall_total if overall_total else 0
+    st.progress(overall, text=f"Overall questionnaire progress · {overall}%")
+    st.caption("Counts currently applicable questions. Documentation gaps are tracked separately.")
 
-
-def render_profile_controls():
-    confirmed = bridge.get_product_profile()
-    if confirmed:
-
+    st.subheader("Your Regulatory Profile")
+    if dataset_error is not None:
+        st.warning(f"Complete profile download is unavailable. {dataset_error}")
+    else:
         st.download_button(
-            "Export Confirmed Profile",
-            data=json.dumps(
-                confirmed,
-                indent=2,
-                ensure_ascii=False,
-            ),
-            file_name="regulatory_d21_d22_profile.json",
-            mime="application/json",
-            use_container_width=True,
+            "Download Profile", data=backup, file_name="chat_buddy_confirmed_profile_v2.json",
+            mime="application/json", help="Download the combined D2.1–D2.4 confirmed profile.",
         )
-
-    st.subheader("Restore Saved Profile")
-    uploaded_profile = st.file_uploader(
-        "Choose a previously exported JSON profile",
-        type=["json"],
-        key="restore_profile_upload",
-    )
-    if st.button("Restore from JSON", disabled=uploaded_profile is None,
-                 use_container_width=True):
-        success, error = restore_profile(uploaded_profile)
-        if success:
-            st.rerun()
+    with st.expander("Other download formats"):
+        st.download_button(
+            "Download combined D2.1–D2.3 JSON", data=dump_combined_profile(bridge, algorithms),
+            file_name="chat_buddy_confirmed_profile_v1.json", mime="application/json",
+        )
+        if confirmed:
+            st.download_button(
+                "Export Confirmed Profile", data=json.dumps(confirmed, indent=2, ensure_ascii=False),
+                file_name="regulatory_d21_d22_profile.json", mime="application/json",
+                help="Legacy D2.1/D2.2 only.",
+            )
+    uploaded = st.file_uploader("Upload Profile", type=["json"], key="profile_upload",
+                                help="Accepts combined Chat Buddy backups and legacy D2.1/D2.2 JSON.")
+    if uploaded is not None:
+        try:
+            profile = load_profile_upload(uploaded.getvalue())
+        except ProfileImportError as error:
+            st.error(f"Cannot restore this profile. {error}")
         else:
-            st.error(error)
+            if isinstance(profile, CombinedProfile):
+                with st.expander("Preview uploaded Chat Buddy profile", expanded=True):
+                    render_combined_restore(profile)
+            else:
+                st.write(f"Legacy D2.1/D2.2 profile · {len(profile.answers)} confirmed answers")
+                st.warning("Restoring replaces D2.1/D2.2 answers. Existing algorithm and dataset records are preserved.")
+                if st.button("Restore from JSON"):
+                    apply_legacy_profile(profile)
+                    st.rerun()
 
-    render_combined_profile_io()
 
+def render_assessment_reset():
     if st.button(
         "Start New Assessment",
         use_container_width=True,
@@ -803,7 +762,7 @@ st.info(
 chat_tab = st.container()
 manual_tab = st.expander("Review & Edit", expanded=st.session_state.get("d23_show_manual", False))
 with manual_tab:
-    render_profile_controls()
+    render_assessment_reset()
 
 
 # ============================================================

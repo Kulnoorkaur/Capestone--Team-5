@@ -126,6 +126,22 @@ def dump_combined_profile(
 def load_combined_profile(raw: str | bytes, *, allow_d24: bool = False) -> CombinedProfile:
     """Validate fresh stores. Chat Buddy opts into v2; v1-only consumers stay unchanged."""
     profile = _read_json(raw)
+    return _load_combined(profile, allow_d24=allow_d24)
+
+
+def load_profile_upload(raw: bytes) -> QuestionnaireBridge | CombinedProfile:
+    """Dispatch Chat Buddy uploads without interpreting a combined backup as flat answers."""
+    if len(raw) > 1_000_000:
+        raise ProfileImportError("File exceeds 1 MB.")
+    profile = _read_json(raw)
+    if isinstance(profile, dict) and profile.keys() & {
+        "schema", "version", "product", "ai_function", "algorithms", "dataset_evidence",
+    }:
+        return _load_combined(profile, allow_d24=True)
+    return _load_bridge(profile)
+
+
+def _load_combined(profile, *, allow_d24):
     if not isinstance(profile, dict) or profile.get("schema") != COMBINED_SCHEMA:
         raise ProfileImportError("Expected a Chat Buddy combined profile.")
     version = profile.get("version")
