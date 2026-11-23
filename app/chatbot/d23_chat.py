@@ -174,17 +174,22 @@ def _algorithm_conversation(conversations, algorithm_id):
     })
 
 
-def _submit_turn(adapter, conversation, algorithm_id, field_id, message, *, initial=False, question=None):
+def _submit_turn(adapter, conversation, algorithm_id, field_id, message, *, initial=False, question=None,
+                 retry_source=None):
     algorithm = adapter.get_algorithm(algorithm_id)
     active = adapter.active_field_ids(algorithm_id)
     other_names = [
         adapter.get_algorithm(other_id)["name"]
         for other_id in adapter.algorithm_ids if other_id != algorithm_id
     ]
-    conversation["turns"].append(message)
-    source_id = str(len(conversation["turns"]))
-    if question:
-        conversation.setdefault("questions", {})[source_id] = question
+    if retry_source is None:
+        conversation["turns"].append(message)
+        source_id = str(len(conversation["turns"]))
+        if question:
+            conversation.setdefault("questions", {})[source_id] = question
+    else:
+        source_id = retry_source
+    conversation.pop("retry_turn", None)
     conversation["notice_target"] = None if initial else field_id
     conversation["request_failed"] = False
     bridge = st.session_state.get("questionnaire_bridge")
@@ -210,9 +215,16 @@ def _submit_turn(adapter, conversation, algorithm_id, field_id, message, *, init
             detail_followup=followup,
             original_reply=conversation["turns"][int(pending["source_id"]) - 1] if pending and followup else None,
         )
-    except Exception:
+    except Exception as error:
         conversation["request_failed"] = True
-        conversation["notice"] = "Gemini could not process that answer. Your message is retained. You can answer using the controls below."
+        if getattr(error, "code", None) in {429, 500, 502, 503, 504} or isinstance(error, (TimeoutError, ConnectionError)):
+            conversation["retry_turn"] = {
+                "field": field_id, "source": source_id, "message": message,
+                "revision": st.session_state.d23_answer_revision,
+            }
+            conversation["notice"] = "Gemini is temporarily unavailable. Your message is retained. Use Retry last response to try again."
+        else:
+            conversation["notice"] = "Gemini could not process that answer. Your message is retained. You can answer using the controls below."
         return
     if framework_followup and field_id in suggestions and not suggestions[field_id]["correction"]:
         updated = suggestions[field_id]
@@ -328,8 +340,9 @@ def _same_value(left, right):
 
 
 def _missing_details(field_id, candidate):
-    return bool(candidate.get("unresolved_frameworks")) or needs_details(field_id, candidate["value"]) and (
-        not candidate["details"].strip() or bool(candidate.get("missing_detail"))
+    return bool(
+        candidate.get("unresolved_frameworks") or candidate.get("missing_detail")
+        or (needs_details(field_id, candidate["value"]) and not candidate["details"].strip())
     )
 
 
@@ -733,6 +746,12 @@ def render_d23_chat(*, tools, continue_to_datasets=None):
                     st.write("Some documentation gaps remain. You can review them now or return later.")
                 st.write("Do you need to document another algorithm? Say yes to add one, no to move on to datasets, "
                          "or review gaps to revisit missing information.")
+        retry = conversation.get("retry_turn")
+        if retry and retry["field"] == current and retry["revision"] == state.d23_answer_revision:
+            if st.button("Retry last response", key=f"d23-retry-{algorithm_id}-{retry['source']}"):
+                _submit_turn(adapter, conversation, algorithm_id, current, retry["message"],
+                             retry_source=retry["source"])
+                st.rerun()
         message = st.chat_input(
             "Describe this algorithm or answer in your own words",
             key=f"d23-chat-input-{algorithm_id}", disabled=bool(suggestions) and detail_target is None,

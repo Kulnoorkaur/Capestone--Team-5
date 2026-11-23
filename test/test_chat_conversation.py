@@ -514,6 +514,77 @@ class GuidedConversationTests(unittest.TestCase):
         })
         self.assertEqual(len(calls), 3)
 
+    def test_missing_quote_recovers_only_verbatim_long_answers(self):
+        for field, reply in {
+            "ACC-010": "A drift alert triggers learning. Experts screen labeled photographs and a board approves activation.",
+            "ACC-022": "Regulatory Affairs compares risks, and the quality board records its decision.",
+            "ACC-023": "We run regression testing on an independent holdout set before release.",
+        }.items():
+            with self.subTest(field=field):
+                def respond(prompt, *_args, **_kwargs):
+                    payload = json.loads("{" + prompt.rsplit("\n{", 1)[1])
+                    return {"algorithm_id": "example", "source_id": "1", "candidates": {
+                        field: {"value": candidate, "details": [reply]},
+                    }}
+                with patch.object(chat_llm, "_request_extraction", side_effect=respond):
+                    candidate = reply
+                    suggestions, _ = chat_llm.extract_d23_candidates(
+                        reply, algorithm_id="example", algorithm={"name": "Example", "version": "1", "answers": {}},
+                        source_id="1", active_fields=[field], target_field=field,
+                    )
+                    self.assertEqual(suggestions[field]["quote"], reply)
+                    candidate = "An unsupported paraphrase"
+                    suggestions, clarification = chat_llm.extract_d23_candidates(
+                        reply, algorithm_id="example", algorithm={"name": "Example", "version": "1", "answers": {}},
+                        source_id="1", active_fields=[field], target_field=field,
+                    )
+                    self.assertNotIn(field, suggestions)
+                    self.assertIn("verify the supporting wording", clarification)
+
+    def test_supplied_change_components_and_training_context_are_preserved(self):
+        cases = {
+            "ACC-003": ("It uses supervised learning. We trained it on labeled photographs.", ["Supervised"],
+                        "It uses supervised learning.", "We trained it on labeled photographs."),
+            "ACC-016": ("Planned modification: retrain model weights. Thresholds remain fixed. The objective is to recover sensitivity.",
+                        "retrain model weights", "Planned modification: retrain model weights.", "Thresholds remain fixed"),
+            "ACC-019": ("Yes. The documented change plan PCCP-101 specifies changes and verification. It was prepared for FDA submission.",
+                        "Yes", "The documented change plan PCCP-101 specifies changes and verification.", "FDA submission"),
+        }
+        for field, (reply, value, quote, expected) in cases.items():
+            with self.subTest(field=field), patch.object(chat_llm, "_request_extraction", return_value={
+                "algorithm_id": "example", "source_id": "1", "candidates": {field: {"value": value, "quote": quote}},
+            }):
+                suggestions, _ = chat_llm.extract_d23_candidates(
+                    reply, algorithm_id="example", algorithm={"name": "Example", "version": "1", "answers": {}},
+                    source_id="1", active_fields=[field], target_field=field,
+                )
+                self.assertIn(expected, suggestions[field]["details"])
+                self.assertNotIn("missing_detail", suggestions[field])
+                if field == "ACC-016":
+                    self.assertEqual(suggestions[field]["value"], reply)
+
+    def test_temporary_architecture_failure_can_retry_same_turn(self):
+        class ServiceUnavailable(Exception):
+            code = 503
+
+        adapter, record = self.start_algorithm_at("ACC-004")
+        reply = "It uses one convolutional neural network (CNN) to analyze retinal images."
+        self.d23_extractor.side_effect = ServiceUnavailable()
+        self.submit(f"d23-chat-input-{record}", reply)
+        self.assertTrue(any("temporarily unavailable" in node.value for node in self.app.markdown))
+        self.d23_extractor.side_effect = chat_llm.extract_d23_candidates
+        with patch.object(chat_llm, "_request_extraction", return_value={
+            "algorithm_id": record, "source_id": "2",
+            "candidates": {"ACC-004": {"value": ["CNN"], "details": [reply]}},
+        }):
+            self.click("Retry last response")
+        conversation = self.state.d23_conversations[record]
+        self.assertEqual(conversation["turns"].count(reply), 1)
+        self.assertEqual(conversation["candidates"]["ACC-004"]["quote"], reply)
+        self.assertNotIn("ACC-004", adapter.get_algorithm(record)["answers"])
+        self.click("Confirm suggestion")
+        self.assertEqual(adapter.get_algorithm(record)["answers"]["ACC-004"]["details"], reply)
+
     def test_gemini_error_retains_turn_and_offers_focused_followup(self):
         self.submit("ux_d23_proposal-message", RETINAGUARD)
         self.click("Confirm algorithm record")

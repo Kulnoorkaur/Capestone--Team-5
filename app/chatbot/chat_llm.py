@@ -458,6 +458,11 @@ _D23_NOT_RELEASED = re.compile(
     r"(?:hasn't|haven't|has not|have not) (?:been )?released|no (?:prior |previous |first )?release)\b", re.I,
 )
 _D23_CLARIFICATIONS = {
+    "ACC-003": "How was the model trained? For example, were labeled examples used?",
+    "ACC-004": "Which model family does this algorithm use, and is it one model or several?",
+    "ACC-010": "What triggers learning, what data does it use, and who approves a change before it takes effect?",
+    "ACC-016": "What will change, what limits apply, and what performance effect do you expect?",
+    "ACC-022": "Which criteria do you use, who makes the regulatory decision, and where is it recorded?",
     "ACC-019": "Is there already a documented change plan that lists planned changes and how each will be verified?",
     "ACC-021": "Is the change-control process already documented in an approved procedure, or is it still being developed? "
                "If it is documented, what are the procedure ID and version?",
@@ -566,6 +571,28 @@ def _d23_reference_supported(value, quote, evidence, confirmed_answers, *, prefi
         ):
             return False
     return True
+
+
+_D23_GROUNDED_TEXT = {"ACC-010", "ACC-016", "ACC-022", "ACC-023"}
+
+
+def _d23_components(field_id, source):
+    """Identify explicitly supplied components and return the missing prompts."""
+    patterns = {
+        "ACC-016": {
+            "what will change": r"\b(?:retrain\w*|updat\w*|modif\w*|chang\w*)\b",
+            "what limits apply": r"\b(?:remain\w* fixed|unchanged|limit\w*|only|without|restrict\w*)\b",
+            "the expected effect on performance": r"\b(?:objective|aim|expect\w*|intend\w*)\b[^.!?]*"
+                                                 r"\b(?:performance|sensitivity|specificity|accuracy|baseline)\b",
+        },
+        "ACC-019": {
+            "the document identifying the change plan": r"\b(?:PCCP|plan|document)[ -][A-Z]*-?\d"
+                                                        r"|\b(?:plan|document)\s+(?:called|titled|named)\b",
+            "the regulatory framework": r"\b(?:FDA|Health Canada|EU MDR|EU AI Act|European Union|"
+                                        r"Medical Device Regulation|internal framework|not tied to any framework)\b",
+        },
+    }
+    return [name for name, pattern in patterns[field_id].items() if not re.search(pattern, source, re.I)]
 
 
 def _d23_confirmed_output_quote(message, outputs):
@@ -769,7 +796,14 @@ supports the entire value. Optional details must be copied verbatim from that
 user_message. The details can be an array of exact excerpts that explain the
 proposed answer, including sentences outside its short value quote. Include an
 explanation wherever the user provides one, especially for Yes or Unknown when
-the question asks why or requests specifics. A supplied explanation is useful
+the question asks why or requests specifics. Every candidate, including long
+text and architecture, must contain a separate verbatim quote key even if the
+value or details quotes the same text. Never omit quote. For ACC-010, ACC-016,
+ACC-022 and ACC-023 retain all the supplied answer components. For ACC-016 this
+means the change, constraints and performance effect. For ACC-019 preserve
+both the plan identifier and explicit framework. For ACC-003 preserve stated
+labeled training data and who labeled it alongside a supported learning method.
+A supplied explanation is useful
 even when optional. A direct Yes or No can be extracted even when its details
 are missing. If a required detail is absent, retain the supported value and
 include a short missing_detail question on that candidate about the specific
@@ -833,11 +867,22 @@ and pending conformity assessment does not imply review of the change plan.
         direct = _d23_direct_reply(message, target.get("options", ()))
 
     blocked_target = False
+    evidence_missing = False
     for field_id, proposed in candidates.items():
         if field_id not in fields or not isinstance(proposed, dict) or "value" not in proposed:
             continue
         quote = proposed.get("quote")
+        if not _quoted_in(quote, message) and not other_mentions and field_id == target_field:
+            value = proposed["value"]
+            if field_id in _D23_GROUNDED_TEXT and _quoted_in(value, message):
+                quote = value
+            elif field_id == "ACC-004" and value == ["CNN"]:
+                parts = proposed.get("details") or proposed.get("explanation")
+                parts = parts if isinstance(parts, list) else [parts]
+                quote = next((part for part in parts if _quoted_in(part, message)
+                              and re.search(r"\b(?:CNN|convolutional neural network)\b", part, re.I)), None)
         if not _quoted_in(quote, message):
+            evidence_missing |= field_id == target_field
             continue
         if other_mentions and (
             not mentions_name(quote, algorithm["name"])
@@ -898,6 +943,16 @@ and pending conformity assessment does not imply review of the change plan.
             value = ", ".join(matches)
         details = (_d23_explanation(proposed.get("details"), source)
                    or _d23_explanation(proposed.get("explanation"), source))
+        if field_id == "ACC-016" and field_id == target_field and not other_mentions and not detail_followup:
+            # This question asks for the complete change description, limits and effect.
+            if "?" not in message:
+                value = details = quote = message
+        if field_id == "ACC-003" and isinstance(value, list) and "Supervised" in value and not other_mentions:
+            training = [part for part in re.split(r"(?<=[.!?])\s+|\n", source)
+                        if re.search(r"\b(?:train\w*|learn\w*)\b", part, re.I)
+                        and re.search(r"\b(?:labeled|labelled|annotated)\b", part, re.I)]
+            if training:
+                details = " ".join(dict.fromkeys(filter(None, [details, *training])))
         if matches:
             role_details = _d23_explanation([
                 excerpt for excerpt in matches.values() if len(re.findall(r"[A-Za-z]+", excerpt)) >= 3
@@ -936,7 +991,8 @@ and pending conformity assessment does not imply review of the change plan.
         if unresolved_frameworks:
             suggestions[field_id]["unresolved_frameworks"] = sorted(unresolved_frameworks)
         missing_detail = proposed.get("missing_detail")
-        if needs_details(field_id, value) and isinstance(missing_detail, str) and missing_detail.strip():
+        if (needs_details(field_id, value) and isinstance(missing_detail, str) and missing_detail.strip()
+              and not (field_id == target_field and field_id in {"ACC-016", "ACC-019"} and not other_mentions)):
             suggestions[field_id]["missing_detail"] = missing_detail.strip()[:300]
     if target_field == "ACC-002" and target and not other_mentions and not detail_followup:
         output_quote = _d23_confirmed_output_quote(message, d22_answers.get("AIF-006"))
@@ -1014,6 +1070,16 @@ and pending conformity assessment does not imply review of the change plan.
                 "algorithm_id": algorithm_id, "field_id": target_field, "source_id": source_id,
                 "quote": quote, "value": value, "details": details, "correction": correction,
             }
+    change = suggestions.get(target_field)
+    if not detail_followup and not other_mentions and change and (
+        target_field == "ACC-016" or (target_field == "ACC-019" and change["value"] in ("Yes", "Partly"))
+    ):
+        if target_field == "ACC-019" and "?" not in message:
+            change["details"] = message
+        support = change["details"] or change["quote"]
+        missing_components = _d23_components(target_field, support)
+        if missing_components:
+            change["missing_detail"] = "Could you specify " + " and ".join(missing_components) + "?"
     if detail_followup and not correction and not other_mentions:
         details = _d23_explanation(result.get("followup_details", ""), message)
         proposed = suggestions.pop(target_field, None)
@@ -1024,6 +1090,15 @@ and pending conformity assessment does not imply review of the change plan.
             updated["details"] = " ".join(filter(None, (detail_followup["details"], details)))
             updated["detail_source_id"] = source_id
             remaining = result.get("remaining_detail")
+            if target_field in {"ACC-016", "ACC-019"}:
+                support = updated["details"]
+                if original_reply and original_reply not in support:
+                    support = f"{original_reply} {support}"
+                updated["details"] = support
+                missing_components = _d23_components(target_field, support)
+                remaining = ("Could you specify " + " and ".join(missing_components) + "?") if missing_components else ""
+                if target_field == "ACC-016":
+                    updated["value"] = support
             if isinstance(remaining, str) and remaining.strip():
                 updated["missing_detail"] = remaining.strip()[:300]
             suggestions[target_field] = updated
@@ -1035,6 +1110,15 @@ and pending conformity assessment does not imply review of the change plan.
         ):
             procedure["missing_detail"] = "What is the procedure's document ID and version?"
     clarification = result.get("clarification", "")
+    if evidence_missing and target_field not in suggestions and target_field in _D23_GROUNDED_TEXT | {"ACC-004"}:
+        context = {
+            "ACC-004": "the model family and how it is used",
+            "ACC-010": "what triggers learning, what data it uses, and who approves the change",
+            "ACC-016": "the planned change, its limits, and its expected performance effect",
+            "ACC-022": "your decision criteria, who decides, and where the decision is recorded",
+            "ACC-023": "the tests you perform before release and what they check",
+        }[target_field]
+        clarification = f"Your response is retained. I couldn’t verify the supporting wording for this suggestion. Could you clarify {context}?"
     if (blocked_target or not clarification) and target_field not in suggestions and target_field in _D23_CLARIFICATIONS:
         clarification = _D23_CLARIFICATIONS[target_field]
     if target_field == "ACC-020" and target_field not in suggestions and not clarification:
